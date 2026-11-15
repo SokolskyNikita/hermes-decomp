@@ -161,7 +161,9 @@ impl MetroDetector {
 
             // Metro format: __d(undefined, factory, moduleId, deps)
             // Arguments: [0] = undefined/context, [1] = function, [2] = moduleId, [3] = deps
-            if arguments.len() == 4 {
+            // A module with no dependencies is registered as __d(factory, moduleId),
+            // with no deps argument at all.
+            if arguments.len() == 4 || arguments.len() == 3 {
                 // Get function ID - either directly or via register/variable lookup
                 let function_id = match &arguments[1] {
                     Expression::Function { id, .. } => Some(id.0),
@@ -192,19 +194,19 @@ impl MetroDetector {
                 };
 
                 // Get dependencies - either directly or via register/variable lookup
-                let dependencies = match &arguments[3] {
-                    Expression::Array { .. } => {
-                        extract_array_of_integers(&arguments[3], Some(reg_integers))
-                            .unwrap_or_default()
+                let dependencies = match arguments.get(3) {
+                    None => Vec::new(),
+                    Some(deps @ Expression::Array { .. }) => {
+                        extract_array_of_integers(deps, Some(reg_integers)).unwrap_or_default()
                     }
-                    Expression::Value(Value::Binding(Binding::Register(r))) => reg_arrays
+                    Some(Expression::Value(Value::Binding(Binding::Register(r)))) => reg_arrays
                         .get(&format!("r{r}"))
                         .cloned()
                         .unwrap_or_default(),
-                    Expression::Value(Value::Binding(Binding::Variable(n))) => {
+                    Some(Expression::Value(Value::Binding(Binding::Variable(n)))) => {
                         reg_arrays.get(n).cloned().unwrap_or_default()
                     }
-                    _ => Vec::new(),
+                    Some(_) => Vec::new(),
                 };
 
                 // Register the module if we have function and module IDs
@@ -306,4 +308,60 @@ pub(crate) fn is_meaningful_name(name: &str) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Constant, FunctionId};
+
+    fn factory(id: u32) -> Expression {
+        Expression::Function {
+            id: FunctionId(id),
+            name: None,
+            is_arrow: false,
+            is_async: false,
+            is_generator: false,
+        }
+    }
+
+    fn int(n: i32) -> Expression {
+        Expression::Value(Value::Constant(Constant::Integer(n)))
+    }
+
+    fn define(arguments: Vec<Expression>) -> Statement {
+        Statement::Expr(Expression::Call {
+            callee: Box::new(Expression::Value(Value::Binding(Binding::Variable(
+                "__d".into(),
+            )))),
+            arguments,
+        })
+    }
+
+    // Metro registers a module without dependencies as `__d(factory, id)`.
+    // With the receiver that is three call arguments and no deps array.
+    #[test]
+    fn detects_modules_with_and_without_a_dependency_map() {
+        let undefined = || Expression::Value(Value::Constant(Constant::Undefined));
+        let stmts = vec![
+            define(vec![
+                undefined(),
+                factory(1),
+                int(0),
+                Expression::Array {
+                    elements: vec![Some(int(1))],
+                },
+            ]),
+            define(vec![undefined(), factory(2), int(1)]),
+        ];
+        let mut registry = MetroRegistry::new();
+        MetroDetector::analyze_statements(&stmts, &mut registry, &HashMap::new());
+
+        assert_eq!(registry.modules.len(), 2);
+        assert_eq!(registry.modules[&0].function_id, 1);
+        assert_eq!(registry.modules[&0].dependencies, vec![1]);
+        assert_eq!(registry.modules[&1].function_id, 2);
+        assert!(registry.modules[&1].dependencies.is_empty());
+        assert_eq!(registry.function_to_module.get(&2), Some(&1));
+    }
 }
