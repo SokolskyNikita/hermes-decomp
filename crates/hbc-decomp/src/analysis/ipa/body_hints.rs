@@ -221,14 +221,14 @@ fn collect_body_param_hints_expr(expr: &Expression, hints: &mut BTreeMap<u32, Ve
         }
         Expression::Member {
             object,
-            property: PropertyKey::Ident(prop),
+            property: PropertyKey::Ident(_),
             ..
         } => {
-            if let Expression::Value(Value::Parameter(idx)) = &**object {
-                if !is_generic_property(prop) && param_name_from_method(prop).is_none() {
-                    hints.entry(*idx).or_default().push(prop.clone());
-                }
-            }
+            // `param.prop` reads FROM the parameter, so `prop` names the value
+            // read, never the parameter itself. Naming the parameter `prop` made
+            // `act.type` render as `type = type.type` and `o.fn.call(o)` as
+            // `fn = fn.fn; fn.call(fn)`. Receiver naming is left to the
+            // property-set post-pass (2+ distinct properties).
             collect_body_param_hints_expr(object, hints);
         }
         Expression::Binary { left, right, .. } => {
@@ -324,7 +324,17 @@ mod tests {
             Statement::Return(Some(member(0, "type"))),
         ];
         let hints = infer_param_names_from_body(&stmts);
-        assert_eq!(hints, vec![(0, "type".to_string())]);
+        // reading `.type` must not name the parameter `type`
+        assert!(!hints.contains(&(0, "type".to_string())));
+    }
+
+    #[test]
+    fn a_property_read_does_not_name_the_parameter() {
+        // `arg0.type` and `arg0.fn` read from arg0; neither is arg0's name.
+        let stmts = vec![Statement::Return(Some(member(0, "type")))];
+        assert!(infer_param_names_from_body(&stmts).is_empty());
+        let stmts = vec![Statement::Return(Some(member(0, "fn")))];
+        assert!(infer_param_names_from_body(&stmts).is_empty());
     }
 
     // A parameter invoked directly is named with the "fn" type fallback when no
