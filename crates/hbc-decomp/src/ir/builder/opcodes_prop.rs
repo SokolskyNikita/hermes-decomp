@@ -1,7 +1,7 @@
 // Opcode handlers for property access operations.
 
 use super::opcodes_load::{get_reg, reg_expr};
-use crate::ir::{AssignTarget, Binding, Expression, PropertyKey, Statement};
+use crate::ir::{AssignTarget, Binding, Expression, PropertyKey, Statement, UnaryOp};
 use crate::{BytecodeFile, Instruction};
 
 // Handle GetById opcodes.
@@ -180,13 +180,16 @@ pub fn handle_del_by_val(inst: &Instruction) -> Option<Statement> {
     let key = reg_expr(&inst.operands, 2)?;
 
     // delete obj[key]
-    Some(Statement::Delete {
-        target: Expression::Member {
-            object: Box::new(obj),
-            property: PropertyKey::Computed(Box::new(key)),
-            optional: false,
+    Some(Statement::Assign {
+        target: AssignTarget::Binding(Binding::Register(dst)),
+        value: Expression::Unary {
+            op: UnaryOp::Delete,
+            operand: Box::new(Expression::Member {
+                object: Box::new(obj),
+                property: PropertyKey::Computed(Box::new(key)),
+                optional: false,
+            }),
         },
-        result: Some(dst),
     })
 }
 
@@ -227,13 +230,16 @@ pub fn handle_del_by_id(
     };
 
     // delete obj.prop
-    Some(Statement::Delete {
-        target: Expression::Member {
-            object: Box::new(obj),
-            property: PropertyKey::Ident(prop_name),
-            optional: false,
+    Some(Statement::Assign {
+        target: AssignTarget::Binding(Binding::Register(dst)),
+        value: Expression::Unary {
+            op: UnaryOp::Delete,
+            operand: Box::new(Expression::Member {
+                object: Box::new(obj),
+                property: PropertyKey::Ident(prop_name),
+                optional: false,
+            }),
         },
-        result: Some(dst),
     })
 }
 

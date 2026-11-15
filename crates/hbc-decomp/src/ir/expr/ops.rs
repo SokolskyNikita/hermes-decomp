@@ -104,6 +104,7 @@ pub enum UnaryOp {
     // `++x` / `--x`. The Inc/Dec opcodes use these; `x + 1` throws on a BigInt.
     Inc,
     Dec,
+    Delete,
 }
 
 impl UnaryOp {
@@ -117,6 +118,7 @@ impl UnaryOp {
             UnaryOp::Void => "void ",
             UnaryOp::Inc => "++",
             UnaryOp::Dec => "--",
+            UnaryOp::Delete => "delete ",
         }
     }
 }

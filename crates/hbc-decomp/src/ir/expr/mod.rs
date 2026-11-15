@@ -154,6 +154,10 @@ impl Expression {
             Expression::Binary { left, right, .. } => {
                 left.has_side_effects() || right.has_side_effects()
             }
+            Expression::Unary {
+                op: UnaryOp::Delete,
+                ..
+            } => true,
             Expression::Unary { operand, .. } => operand.has_side_effects(),
             Expression::Member {
                 object, property, ..
@@ -194,5 +198,25 @@ impl Expression {
             | Expression::Unknown { .. } => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+
+    #[test]
+    fn delete_of_a_pure_member_still_has_side_effects() {
+        let member = Expression::Member {
+            object: Box::new(Expression::Value(Value::This)),
+            property: PropertyKey::Ident("a".into()),
+            optional: false,
+        };
+        let del = Expression::Unary {
+            op: UnaryOp::Delete,
+            operand: Box::new(member),
+        };
+        assert!(del.has_side_effects());
+        assert_eq!(UnaryOp::Delete.as_str(), "delete ");
     }
 }
