@@ -75,8 +75,19 @@ fn fold_array_spreads(stmts: &mut Vec<Statement>) {
         let mut saw_spread = false;
         let mut j = i + 1;
         while j < stmts.len() {
-            if let Some(src) = arr_spread_into(&stmts[j], &aliases) {
-                elements.push(Some(Expression::Spread(Box::new(src))));
+            if let Some((srcs, val)) = put_with_spread_index(&stmts[j], &aliases) {
+                // `arr[arraySpread(arr, src, n)] = v` (the spread call was inlined
+                // into the put's index).
+                for src in srcs {
+                    elements.push(Some(Expression::Spread(Box::new(src))));
+                }
+                elements.push(Some(val));
+                saw_spread = true;
+                remove.push(j);
+            } else if let Some(srcs) = arr_spread_into(&stmts[j], &aliases) {
+                for src in srcs {
+                    elements.push(Some(Expression::Spread(Box::new(src))));
+                }
                 saw_spread = true;
                 remove.push(j);
             } else if let Some(val) = put_into_array(&stmts[j], &aliases) {
@@ -164,13 +175,26 @@ fn existing_elements(stmt: &Statement) -> Vec<Option<Expression>> {
     Vec::new()
 }
 
-// `_ = HermesBuiltin.arraySpread(arr, src, _)` targeting the array -> Some(src).
-fn arr_spread_into(stmt: &Statement, arrs: &std::collections::HashSet<u32>) -> Option<Expression> {
+// `_ = HermesBuiltin.arraySpread(arr, src, _)` targeting the array -> the sources
+// to spread, in order.
+fn arr_spread_into(
+    stmt: &Statement,
+    arrs: &std::collections::HashSet<u32>,
+) -> Option<Vec<Expression>> {
     let value = match stmt {
         Statement::Assign { value, .. } => value,
         Statement::Expr(value) => value,
         _ => return None,
     };
+    spread_sources(value, arrs)
+}
+
+// An `arraySpread(arr, src, idx)` call on the array -> [sources of any spread
+// call inlined into `idx` (they ran first), then `src`].
+fn spread_sources(
+    value: &Expression,
+    arrs: &std::collections::HashSet<u32>,
+) -> Option<Vec<Expression>> {
     let args = is_builtin_call(value, "arraySpread")?;
     // `[target, source, ...]` is the real call. CallBuiltin also keeps the
     // frame's `this` slot, so the same call can arrive as
@@ -183,7 +207,26 @@ fn arr_spread_into(stmt: &Statement, arrs: &std::collections::HashSet<u32>) -> O
     } else {
         return None;
     };
-    args.get(source_at).cloned()
+    let mut out = args
+        .get(source_at + 1)
+        .map(|i| nested_sources(i, arrs))
+        .unwrap_or_default();
+    out.push(args.get(source_at)?.clone());
+    Some(out)
+}
+
+// The running index of a later spread: an inlined earlier `arraySpread` call,
+// possibly plus a constant (`arraySpread(..) + 1`).
+fn nested_sources(idx: &Expression, arrs: &std::collections::HashSet<u32>) -> Vec<Expression> {
+    match idx {
+        Expression::Call { .. } => spread_sources(idx, arrs).unwrap_or_default(),
+        Expression::Binary {
+            op: crate::ir::BinaryOp::Add,
+            left,
+            ..
+        } => nested_sources(left, arrs),
+        _ => Vec::new(),
+    }
 }
 
 fn reg_in(expr: &Option<&Expression>, arrs: &std::collections::HashSet<u32>) -> bool {
@@ -191,6 +234,23 @@ fn reg_in(expr: &Option<&Expression>, arrs: &std::collections::HashSet<u32>) -> 
         Some(Expression::Value(Value::Binding(Binding::Register(r)))) => arrs.contains(r),
         _ => false,
     }
+}
+
+// `arr[HermesBuiltin.arraySpread(arr, src, n)] = val` -> Some((sources, val)).
+fn put_with_spread_index(
+    stmt: &Statement,
+    arrs: &std::collections::HashSet<u32>,
+) -> Option<(Vec<Expression>, Expression)> {
+    if let Statement::Assign {
+        target: AssignTarget::Index { object, key },
+        value,
+    } = stmt
+    {
+        if reg_in(&Some(object), arrs) {
+            return Some((spread_sources(key, arrs)?, value.clone()));
+        }
+    }
+    None
 }
 
 // `arr[..] = val` targeting the array -> Some(val).
@@ -279,5 +339,82 @@ fn is_hermes_builtin_obj(expr: &Expression) -> bool {
             ..
         } => is_name(p) && matches!(object.as_ref(), Expression::Value(Value::Global)),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::Constant;
+
+    fn reg(r: u32) -> Expression {
+        Expression::Value(Value::Binding(Binding::Register(r)))
+    }
+    fn int(n: i32) -> Expression {
+        Expression::Value(Value::Constant(Constant::Integer(n)))
+    }
+    fn assign(r: u32, value: Expression) -> Statement {
+        Statement::Assign {
+            target: AssignTarget::Binding(Binding::Register(r)),
+            value,
+        }
+    }
+    fn spread_call(arr: u32, src: Expression, idx: Expression) -> Expression {
+        let obj = Expression::Value(Value::Binding(Binding::Variable("HermesBuiltin".into())));
+        Expression::Call {
+            callee: Box::new(Expression::member(obj, "arraySpread")),
+            arguments: vec![reg(99), reg(arr), src, idx],
+        }
+    }
+    fn spreads(e: &Expression) -> Vec<bool> {
+        match e {
+            Expression::Array { elements } => elements
+                .iter()
+                .flatten()
+                .map(|x| matches!(x, Expression::Spread(_)))
+                .collect(),
+            _ => panic!("not an array: {e:?}"),
+        }
+    }
+
+    // `[...a, ...b]`: the first spread is inlined into the second call's index.
+    #[test]
+    fn nested_spread_in_index_keeps_both_sources() {
+        let mut stmts = vec![
+            assign(1, Expression::Array { elements: vec![] }),
+            assign(2, spread_call(1, reg(10), spread_call(1, reg(11), int(0)))),
+        ];
+        transform_spread_rest(&mut stmts);
+        let Statement::Assign { value, .. } = &stmts[0] else {
+            panic!()
+        };
+        assert_eq!(spreads(value), vec![true, true]);
+        assert_eq!(stmts.len(), 1);
+    }
+
+    // `[0, ...a, 9]`: the spread call is inlined into the put's index.
+    #[test]
+    fn spread_inlined_into_put_index() {
+        let mut stmts = vec![
+            assign(
+                1,
+                Expression::Array {
+                    elements: vec![Some(int(0))],
+                },
+            ),
+            Statement::Assign {
+                target: AssignTarget::Index {
+                    object: reg(1),
+                    key: spread_call(1, reg(10), int(1)),
+                },
+                value: int(9),
+            },
+        ];
+        transform_spread_rest(&mut stmts);
+        let Statement::Assign { value, .. } = &stmts[0] else {
+            panic!()
+        };
+        assert_eq!(spreads(value), vec![false, true, false]);
+        assert_eq!(stmts.len(), 1);
     }
 }
