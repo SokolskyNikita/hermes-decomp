@@ -90,6 +90,7 @@ paper/
 *.hbc
 # Tracked crash-regression fixtures, a few hundred bytes each (tests/e2e_corpus.rs).
 !/crates/hbc-decomp-cli/tests/fixtures/*.hbc
+!/crates/hbc-decomp-cli/tests/fixtures/metro/*.hbc
 *.bundle
 *.hasm
 *.apk
