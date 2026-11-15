@@ -309,6 +309,35 @@ fn a_constant_key_used_inside_a_loop_is_substituted() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+// for-of compiled with -O came out as `iter = xs[Symbol.iterator](); v =
+// iter.next(); while (iter !== undefined) { ... }`: the step ran once, before the
+// loop, so the loop never advanced (or never ended). A `return;` inside the loop
+// body was dropped as if it ended the function, and HBC 84's `[k, v]` in the loop
+// read a register the destructuring lost. Source in for_of.source.js, compiled
+// with hermesc -O -g0; the round trip test runs both versions under node.
+#[test]
+fn for_of_loops_come_out_as_for_of() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let tmp = std::env::temp_dir().join(format!("hermes-e2e-forof-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    for v in ["v99", "v84"] {
+        let out = tmp.join(format!("for_of_{v}.js"));
+        decompile(&dir.join(format!("for_of_{v}.hbc")), &out).expect("decompile");
+        let js = std::fs::read_to_string(&out).expect("output");
+        assert!(
+            !js.contains("Symbol.iterator") && !js.contains(".next()") && !js.contains(".return()"),
+            "{v}: iterator protocol left in the output:\n{js}"
+        );
+        // getCap, upTo, sumAll, findFirst, firstNeg, redact.
+        assert_eq!(js.matches("for (const ").count(), 6, "{v}: six for-of loops:\n{js}");
+        // firstNeg's early `return;` inside the loop must survive.
+        let first_neg = js.split("function firstNeg").nth(1).expect("firstNeg");
+        let first_neg = first_neg.split("function ").next().unwrap_or_default();
+        assert!(first_neg.contains("return;"), "{v}: return in the loop dropped:\n{js}");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 fn is_plain_ident(s: &str) -> bool {
     let mut chars = s.chars();
     chars

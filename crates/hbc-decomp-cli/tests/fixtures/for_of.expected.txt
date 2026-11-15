@@ -1,0 +1,5 @@
+3 missing none
+3 6 2 -1
+neg
+count 2
+{"ab":"[R]","abcd":2} 9
