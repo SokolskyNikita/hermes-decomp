@@ -37,6 +37,14 @@ fn is_self_assign_value(name: &str, value: &Expression) -> bool {
 }
 
 pub fn cleanup_noise(stmts: Vec<Statement>) -> Vec<Statement> {
+    cleanup_noise_at(stmts, true)
+}
+
+// `tail`: control falling off the end of `stmts` ends the function, so a final
+// `return;` there is redundant. Inside a loop body, a switch case, a `finally`
+// or an `if` that is followed by more code it is not: dropping it would fall
+// through into the next iteration, case or statement.
+fn cleanup_noise_at(stmts: Vec<Statement>, tail: bool) -> Vec<Statement> {
     let mut result = Vec::new();
 
     for (i, stmt) in stmts.iter().enumerate() {
@@ -62,7 +70,7 @@ pub fn cleanup_noise(stmts: Vec<Statement>) -> Vec<Statement> {
             Statement::Return(Some(expr)) => {
                 if is_undefined_expr(expr) {
                     // If this is the last statement, drop it entirely
-                    if i == stmts.len() - 1 {
+                    if tail && i == stmts.len() - 1 {
                         continue;
                     }
                     // Otherwise convert to bare return
@@ -72,7 +80,7 @@ pub fn cleanup_noise(stmts: Vec<Statement>) -> Vec<Statement> {
                 }
             }
             // Remove trailing bare `return;` if it's the last statement
-            Statement::Return(None) if i == stmts.len() - 1 => {
+            Statement::Return(None) if tail && i == stmts.len() - 1 => {
                 continue;
             }
             // Remove dead `while (x !== x)` loops (NaN check artifact from Hermes bytecode)
@@ -113,8 +121,9 @@ pub fn cleanup_noise(stmts: Vec<Statement>) -> Vec<Statement> {
     result = inline_hoisted_aliases_and_trim(result);
 
     // Recurse into sub-blocks
-    for stmt in &mut result {
-        cleanup_noise_recurse(stmt);
+    let last = result.len().saturating_sub(1);
+    for (i, stmt) in result.iter_mut().enumerate() {
+        cleanup_noise_recurse(stmt, tail && i == last);
     }
 
     // Post-recursion: remove empty loops, empty if blocks, and empty blocks
@@ -158,8 +167,32 @@ fn is_effectively_empty_body(stmts: &[Statement]) -> bool {
     })
 }
 
-fn cleanup_noise_recurse(stmt: &mut Statement) {
-    crate::ir::map_nested_bodies_mut(stmt, cleanup_noise);
+fn cleanup_noise_recurse(stmt: &mut Statement, tail: bool) {
+    let take = |b: &mut Vec<Statement>, t: bool| *b = cleanup_noise_at(std::mem::take(b), t);
+    match &mut *stmt {
+        // Falling off a branch of the function's last `if` (or of its last
+        // block / try / catch) still ends the function.
+        Statement::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            take(then_body, tail);
+            take(else_body, tail);
+        }
+        Statement::Block(inner) => take(inner, tail),
+        Statement::TryCatch {
+            try_body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            take(try_body, tail && finally_body.is_empty());
+            take(catch_body, tail && finally_body.is_empty());
+            take(finally_body, false);
+        }
+        other => crate::ir::map_nested_bodies_mut(other, |b| cleanup_noise_at(b, false)),
+    }
 
     // Post-pass: invert empty then-body: `if (x) {} else { ... }` -> `if (!x) { ... }`
     if let Statement::If {
@@ -184,6 +217,35 @@ fn cleanup_noise_recurse(stmt: &mut Statement) {
 mod tests {
     use super::*;
     use crate::ir::{Constant, VarKind};
+
+    #[test]
+    fn return_inside_a_loop_body_is_kept() {
+        // `while (c) { if (x) { return; } }` falls into the next iteration
+        // without the return; only a return at the function's tail is noise.
+        let var = |n: &str| Expression::Value(Value::Binding(Binding::Variable(n.into())));
+        let stmts = vec![
+            Statement::While {
+                condition: var("c"),
+                body: vec![Statement::If {
+                    condition: var("x"),
+                    then_body: vec![Statement::Return(None)],
+                    else_body: vec![],
+                }],
+            },
+            Statement::Expr(var("after")),
+            Statement::Return(None),
+        ];
+        let result = cleanup_noise(stmts);
+        let Statement::While { body, .. } = &result[0] else {
+            panic!("loop lost: {result:?}");
+        };
+        assert!(
+            matches!(&body[0], Statement::If { then_body, .. } if then_body == &vec![Statement::Return(None)]),
+            "return in the loop dropped: {result:?}"
+        );
+        // The function's own trailing `return;` still goes.
+        assert_eq!(result.len(), 2, "{result:?}");
+    }
 
     #[test]
     fn test_let_self_assign_variable_removed() {

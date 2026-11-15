@@ -44,7 +44,7 @@ pub fn detect_iterator_destructuring(stmts: Vec<Statement>) -> Vec<Statement> {
         if let Some((iter_reg, src, next_reg)) = begin {
             if let Some(close) = find_close(&stmts, i + 1, iter_reg) {
                 let used_after = registers_used_in(&stmts[close + 1..]);
-                let elements =
+                let (elements, extra_holders) =
                     collect_elements(&stmts[i + 1..=close], iter_reg, next_reg, &used_after);
                 // Reconstruct only when every element is bound to a distinct
                 // register (holes excluded). Otherwise leave the iterator form.
@@ -80,6 +80,16 @@ pub fn detect_iterator_destructuring(stmts: Vec<Statement>) -> Vec<Statement> {
                         target: AssignTarget::DestructuringArray(targets),
                         value: src,
                     });
+                    // Other registers that still hold an element's value at the
+                    // end of the block and are read later (HBC 84 copies the
+                    // value through a temp into the binding's register) keep
+                    // their value as a copy of the bound one.
+                    for (dst, bound) in extra_holders {
+                        result.push(Statement::Assign {
+                            target: AssignTarget::Binding(Binding::Register(dst)),
+                            value: Expression::Value(Value::Binding(Binding::Register(bound))),
+                        });
+                    }
                     i = close + 1;
                     continue;
                 }
@@ -366,13 +376,14 @@ fn registers_used_in(stmts: &[Statement]) -> HashSet<u32> {
 // register, which destructuring element's value it currently holds. Each
 // `iter.next()` opens a new element; a register read after the block that holds
 // an element's value is that element's target. Returns one entry per element
-// (`Some(reg)` bound, `None` hole).
+// (`Some(reg)` bound, `None` hole), plus `(reg, bound)` for every other register
+// that also holds a bound element's value at the end and is read afterwards.
 fn collect_elements(
     stmts: &[Statement],
     iter_reg: u32,
     next_reg: Option<u32>,
     used_after: &HashSet<u32>,
-) -> Vec<Option<u32>> {
+) -> (Vec<Option<u32>>, Vec<(u32, u32)>) {
     let mut st = WalkState {
         iter_reg,
         next_reg,
@@ -382,7 +393,34 @@ fn collect_elements(
         result_to_elem: HashMap::new(),
     };
     st.walk(stmts);
-    st.elements
+    let mut elements = st.elements;
+    let mut extra = Vec::new();
+    for (idx, slot) in elements.iter_mut().enumerate() {
+        // Registers holding this element's value when the block ends.
+        let mut holders: Vec<u32> = st
+            .reg_to_elem
+            .iter()
+            .filter(|(r, &e)| e == idx && used_after.contains(r))
+            .map(|(&r, _)| r)
+            .collect();
+        holders.sort_unstable();
+        // Keep the chosen binding if it still holds the value, else pick one.
+        let bound = match *slot {
+            Some(r) if holders.contains(&r) => r,
+            _ => match holders.first() {
+                Some(&r) => r,
+                None => continue,
+            },
+        };
+        *slot = Some(bound);
+        extra.extend(
+            holders
+                .into_iter()
+                .filter(|&r| r != bound)
+                .map(|r| (r, bound)),
+        );
+    }
+    (elements, extra)
 }
 
 struct WalkState<'a> {

@@ -140,7 +140,7 @@ impl MutVisitor for ExpressionInliner {
                 // multiple defs is loop-carried or reassigned; inlining one of its
                 // definitions into a use elsewhere (e.g. across a loop back-edge)
                 // is unsound, this is what silently broke counting loops.
-                if uses == 1 && defs == 1 {
+                if uses == 1 && defs == 1 && !is_iterator_next_call(value) {
                     // Candidate for pending (chaining)
                     pending.push((*r, stmt.clone(), value.clone()));
                     continue; // Do not emit yet
@@ -211,6 +211,31 @@ fn stmt_uses(stmt: &Statement, reg: u32) -> bool {
 // True if `stmt` assigns to any register that `value` reads. Such a write
 // invalidates a pending copy of `value`, since inlining it later would capture
 // the post-write register state.
+// `R.next()` on a register may be Hermes' IteratorNext, which also sets `R` to
+// `undefined` once exhausted. The register is an alias of the iterator whose
+// done-check may read a different copy, so the call must stay in place rather
+// than sink to its single use past those reads.
+fn is_iterator_next_call(value: &Expression) -> bool {
+    if let Expression::Call { callee, arguments } = value {
+        if let (
+            true,
+            Expression::Member {
+                object,
+                property: crate::ir::PropertyKey::Ident(p),
+                ..
+            },
+        ) = (arguments.is_empty(), callee.as_ref())
+        {
+            return p == "next"
+                && matches!(
+                    object.as_ref(),
+                    Expression::Value(Value::Binding(Binding::Register(_)))
+                );
+        }
+    }
+    false
+}
+
 fn stmt_redefines_source(stmt: &Statement, value: &Expression) -> bool {
     let mut reads: HashSet<u32> = HashSet::new();
     collect_read_regs(value, &mut reads);

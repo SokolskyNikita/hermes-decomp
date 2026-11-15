@@ -1,5 +1,8 @@
 use super::{is_iterator_call, unwrap_iterator_body};
 use crate::analysis::rename_registers;
+use crate::ir::utils::{
+    expr_uses_register, for_each_nested_body, map_nested_bodies, stmt_uses_register,
+};
 use crate::ir::{AssignTarget, Binding, Expression, PropertyKey, Statement, Value};
 use std::collections::BTreeMap;
 
@@ -145,22 +148,21 @@ fn try_match_for_of(stmts: &[Statement]) -> Option<(usize, Vec<Statement>)> {
                 iter_aliases.push(*dst);
                 idx += 1;
             }
-            // x = undefined (the sentinel constant), keep it, it may be read later.
+            // Any other plain value load into a register: the `undefined` done
+            // sentinel, a hoisted constant (`null`, a string, a number), or the
+            // `Mov idx, src` that HBC >= 98 emits before every `IteratorNext`. At
+            // -O copy propagation has often already turned that source into a
+            // parameter or variable read (`r = arg0`), so any register-free value
+            // counts. Keep it (it may be read later) and keep scanning so the
+            // following `val = iter.next()` is still recognised. A load that
+            // overwrites a register the iterable reads would change what the
+            // for-of header evaluates, so it ends the scan.
             Statement::Assign {
-                target: AssignTarget::Binding(Binding::Register(_)),
-                value: Expression::Value(Value::Constant(crate::ir::Constant::Undefined)),
-            } => {
-                kept.push(stmt.clone());
-                idx += 1;
-            }
-            // An unrelated register copy in the plumbing. HBC ≥98 copies the
-            // source into the index slot (`Mov idx, src`) BEFORE `IteratorNext`,
-            // which isn't an iterator alias, keep it and keep scanning so the
-            // following `val = iter.next()` is still recognised.
-            Statement::Assign {
-                target: AssignTarget::Binding(Binding::Register(_)),
-                value: Expression::Value(Value::Binding(Binding::Register(_))),
-            } => {
+                target: AssignTarget::Binding(Binding::Register(dst)),
+                value: Expression::Value(v),
+            } if !matches!(v, Value::Binding(Binding::Register(src)) if iter_aliases.contains(src))
+                && !expr_uses_register(&source, *dst) =>
+            {
                 kept.push(stmt.clone());
                 idx += 1;
             }
@@ -181,6 +183,20 @@ fn try_match_for_of(stmts: &[Statement]) -> Option<(usize, Vec<Statement>)> {
 
     // Strip the iterator try/return plumbing and the trailing `// continue`.
     let mut loop_body = unwrap_iterator_body(body, iter_reg);
+    // `IteratorClose` before an early `break`/`return` is implied by for-of.
+    loop_body = strip_iterator_close(loop_body, &iter_aliases);
+    // The back edge to the iterator step shows up as a final `continue;`.
+    if matches!(loop_body.last(), Some(Statement::Continue(None))) {
+        loop_body.pop();
+    }
+    // Anything else that still touches the iterator (or re-steps it) has no
+    // for-of equivalent; leave the loop as it is.
+    if iter_aliases
+        .iter()
+        .any(|&a| loop_body.iter().any(|s| stmt_reads_register_deep(s, a)))
+    {
+        return None;
+    }
     // Rename the value register to a named loop variable.
     let var_name = format!("item{val_reg}");
     let mut map = BTreeMap::new();
@@ -193,6 +209,119 @@ fn try_match_for_of(stmts: &[Statement]) -> Option<(usize, Vec<Statement>)> {
         body: detect_for_of_loops(loop_body),
     });
     Some((idx + 1, kept))
+}
+
+// Remove `alias.return()` (the lowered `IteratorClose` on an early exit) from a
+// for-of body, at any depth except inside nested functions, together with the
+// `copy = iter` moves that only fed it. for-of closes the iterator itself on
+// `break`/`return`/`throw`.
+fn strip_iterator_close(body: Vec<Statement>, iter_aliases: &[u32]) -> Vec<Statement> {
+    // Body-local copies of the iterator (`r = iter` right before the close).
+    let mut aliases = iter_aliases.to_vec();
+    collect_local_aliases(&body, &mut aliases);
+    let stripped = remove_close_calls(body, &aliases);
+    let local: Vec<u32> = aliases[iter_aliases.len()..].to_vec();
+    remove_dead_copies(stripped, &local)
+}
+
+fn collect_local_aliases(body: &[Statement], aliases: &mut Vec<u32>) {
+    for stmt in body {
+        if let Statement::Assign {
+            target: AssignTarget::Binding(Binding::Register(dst)),
+            value: Expression::Value(Value::Binding(Binding::Register(src))),
+        } = stmt
+        {
+            if aliases.contains(src) && !aliases.contains(dst) {
+                aliases.push(*dst);
+            }
+        }
+        for_each_nested_body(stmt, &mut |b| collect_local_aliases(b, aliases));
+    }
+}
+
+fn is_close_call(stmt: &Statement, aliases: &[u32]) -> bool {
+    let Statement::Expr(Expression::Call { callee, arguments }) = stmt else {
+        return false;
+    };
+    if !arguments.is_empty() {
+        return false;
+    }
+    matches!(callee.as_ref(), Expression::Member {
+        object,
+        property: PropertyKey::Ident(p),
+        ..
+    } if p == "return"
+        && matches!(object.as_ref(), Expression::Value(Value::Binding(Binding::Register(r))) if aliases.contains(r)))
+}
+
+fn remove_close_calls(body: Vec<Statement>, aliases: &[u32]) -> Vec<Statement> {
+    body.into_iter()
+        .filter(|s| !is_close_call(s, aliases))
+        .map(|s| map_nested_bodies(s, |b| remove_close_calls(b, aliases)))
+        .collect()
+}
+
+fn remove_dead_copies(body: Vec<Statement>, local: &[u32]) -> Vec<Statement> {
+    if local.is_empty() {
+        return body;
+    }
+    let dead: Vec<u32> = local
+        .iter()
+        .copied()
+        .filter(|&r| !body.iter().any(|s| stmt_reads_register_deep(s, r)))
+        .collect();
+    fn go(body: Vec<Statement>, dead: &[u32]) -> Vec<Statement> {
+        body.into_iter()
+            .filter(|s| {
+                !matches!(s, Statement::Assign {
+                    target: AssignTarget::Binding(Binding::Register(dst)),
+                    value: Expression::Value(Value::Binding(Binding::Register(_))),
+                } if dead.contains(dst))
+            })
+            .map(|s| map_nested_bodies(s, |b| go(b, dead)))
+            .collect()
+    }
+    go(body, &dead)
+}
+
+// Does `stmt` read register `reg` anywhere, including nested bodies and the
+// headers of nested loops (`stmt_uses_register` only looks at the top level).
+fn stmt_reads_register_deep(stmt: &Statement, reg: u32) -> bool {
+    let here = match stmt {
+        Statement::For {
+            init,
+            condition,
+            update,
+            ..
+        } => {
+            init.as_deref()
+                .is_some_and(|s| stmt_reads_register_deep(s, reg))
+                || condition
+                    .as_ref()
+                    .is_some_and(|c| expr_uses_register(c, reg))
+                || update
+                    .as_deref()
+                    .is_some_and(|s| stmt_reads_register_deep(s, reg))
+        }
+        Statement::ForOf { iterable, .. } => expr_uses_register(iterable, reg),
+        Statement::ForIn { object, .. } => expr_uses_register(object, reg),
+        Statement::Let { value, .. } => expr_uses_register(value, reg),
+        Statement::DoWhile { condition, .. } => expr_uses_register(condition, reg),
+        Statement::Switch {
+            discriminant,
+            cases,
+            ..
+        } => {
+            expr_uses_register(discriminant, reg)
+                || cases.iter().any(|(c, _)| expr_uses_register(c, reg))
+        }
+        other => stmt_uses_register(other, reg),
+    };
+    let mut nested = false;
+    for_each_nested_body(stmt, &mut |b| {
+        nested |= b.iter().any(|s| stmt_reads_register_deep(s, reg));
+    });
+    here || nested
 }
 
 // `iter_reg.next()`
