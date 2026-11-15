@@ -90,37 +90,45 @@ pub(super) fn apply_pending_to_stmt(
 ) {
     match stmt {
         Statement::Assign { target, value } => {
+            let consumed_target = target.clone();
             apply_pending_to_target(target, pending);
+            let consumed = value.clone();
             substitute_vars_in_expr(value, pending);
-            remove_used_from_pending(value, pending);
-            remove_used_from_target(target, pending);
+            remove_used_from_pending(&consumed, pending);
+            remove_used_from_target(&consumed_target, pending);
         }
         Statement::Let { value, .. } => {
+            let consumed = value.clone();
             substitute_vars_in_expr(value, pending);
-            remove_used_from_pending(value, pending);
+            remove_used_from_pending(&consumed, pending);
         }
         Statement::Class {
             super_class: Some(sc),
             ..
         } => {
+            let consumed = sc.clone();
             substitute_vars_in_expr(sc, pending);
-            remove_used_from_pending(sc, pending);
+            remove_used_from_pending(&consumed, pending);
         }
         Statement::Expr(e) => {
+            let consumed = e.clone();
             substitute_vars_in_expr(e, pending);
-            remove_used_from_pending(e, pending);
+            remove_used_from_pending(&consumed, pending);
         }
         Statement::Return(Some(e)) => {
+            let consumed = e.clone();
             substitute_vars_in_expr(e, pending);
-            remove_used_from_pending(e, pending);
+            remove_used_from_pending(&consumed, pending);
         }
         Statement::Throw(e) => {
+            let consumed = e.clone();
             substitute_vars_in_expr(e, pending);
-            remove_used_from_pending(e, pending);
+            remove_used_from_pending(&consumed, pending);
         }
         Statement::Delete { target, .. } => {
+            let consumed = target.clone();
             substitute_vars_in_expr(target, pending);
-            remove_used_from_pending(target, pending);
+            remove_used_from_pending(&consumed, pending);
         }
         _ => {
             // For structured statements (if/while/for/etc.), flush all pending first

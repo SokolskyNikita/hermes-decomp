@@ -741,4 +741,23 @@ mod pending_order_tests {
         let calls = rendered.iter().filter(|s| s.contains("f()")).count();
         assert_eq!(calls, 1, "f() rendered once: {rendered:?}");
     }
+
+    #[test]
+    fn a_value_stored_through_a_member_is_emitted_once() {
+        // tmp = f(); g.x = tmp   (a single use, in a member store)
+        let stmts = vec![
+            assign("tmp", call("f")),
+            Statement::Assign {
+                target: AssignTarget::Member {
+                    object: var("g"),
+                    property: "x".to_string(),
+                },
+                value: var("tmp"),
+            },
+        ];
+        let out = inline_named_variables(stmts);
+        let rendered: Vec<String> = out.iter().map(|s| s.to_string()).collect();
+        let calls = rendered.iter().filter(|s| s.contains("f()")).count();
+        assert_eq!(calls, 1, "f() rendered once: {rendered:?}");
+    }
 }

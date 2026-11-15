@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 // ```
 pub fn propagate_concatenation(mut stmts: Vec<Statement>) -> Vec<Statement> {
     let mut visitor = ConcatPropagator::new();
+    visitor.use_counts = count_register_uses(&stmts);
     visitor.visit_statement_list(&mut stmts);
     stmts
 }
@@ -27,12 +28,35 @@ pub fn propagate_concatenation(mut stmts: Vec<Statement>) -> Vec<Statement> {
 struct ConcatPropagator {
     // Maps a register to its current known TemplateLiteral state
     tracked_strings: BTreeMap<u32, Expression>,
+    // Reads of each register over the whole body. A template with embedded
+    // expressions is written into a use only when that is the register's single
+    // read; copying it into several uses evaluates its parts once per copy
+    // (`{ [prefix + "A"]: f }` came out with the key built three times).
+    use_counts: BTreeMap<u32, usize>,
+}
+
+fn count_register_uses(stmts: &[Statement]) -> BTreeMap<u32, usize> {
+    struct C(BTreeMap<u32, usize>);
+    impl<'a> crate::ir::Visitor<'a> for C {
+        fn visit_expression(&mut self, expr: &'a Expression) {
+            if let Expression::Value(Value::Binding(Binding::Register(r))) = expr {
+                *self.0.entry(*r).or_insert(0) += 1;
+            }
+            self.walk_expression(expr);
+        }
+    }
+    let mut c = C(BTreeMap::new());
+    for s in stmts {
+        crate::ir::Visitor::visit_statement(&mut c, s);
+    }
+    c.0
 }
 
 impl ConcatPropagator {
     fn new() -> Self {
         Self {
             tracked_strings: BTreeMap::new(),
+            use_counts: BTreeMap::new(),
         }
     }
 
@@ -186,8 +210,14 @@ impl MutVisitor for ConcatPropagator {
         // Replace uses of the tracked string
         if let Some(r) = Self::get_register(expr) {
             if let Some(tmpl) = self.tracked_strings.get(&r) {
-                *expr = tmpl.clone();
-                return;
+                let has_parts = matches!(
+                    tmpl,
+                    Expression::TemplateLiteral { expressions, .. } if !expressions.is_empty()
+                );
+                if !has_parts || self.use_counts.get(&r).copied().unwrap_or(0) <= 1 {
+                    *expr = tmpl.clone();
+                    return;
+                }
             }
         }
 
@@ -248,6 +278,34 @@ mod tests {
             }
         } else {
             panic!("Expected template literal in return array");
+        }
+    }
+
+    #[test]
+    fn a_template_with_parts_is_not_copied_into_several_uses() {
+        // r1 = "k"; r2 = r1 + x; f(r2); g(r2)
+        let x = Expression::Value(Value::Binding(Binding::Variable("x".to_string())));
+        let call = |name: &str, arg: Expression| {
+            Statement::Expr(Expression::Call {
+                callee: Box::new(Expression::Value(Value::Binding(Binding::Variable(
+                    name.to_string(),
+                )))),
+                arguments: vec![arg],
+            })
+        };
+        let stmts = vec![
+            Statement::assign_reg(1, Expression::constant(Constant::String("k".to_string()))),
+            Statement::assign_reg(
+                2,
+                Expression::binary(BinaryOp::Add, Expression::register(1), x),
+            ),
+            call("f", Expression::register(2)),
+            call("g", Expression::register(2)),
+        ];
+        let out = propagate_concatenation(stmts);
+        for s in &out[2..] {
+            let text = s.to_string();
+            assert!(!text.contains('`'), "register kept, not the template: {text}");
         }
     }
 }
