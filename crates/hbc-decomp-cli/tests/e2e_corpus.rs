@@ -263,6 +263,31 @@ fn a_value_merged_across_branches_keeps_one_name() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+// A single-use value computed before an `if` and read inside it after the
+// arm's first statement (or in the `else` arm) lost its definition: the
+// inliner dropped `v = o.load()` to substitute it, the substitution never
+// reached the read, and the output called `print(tmp)` with `tmp` assigned
+// nowhere. 4.21.1 hit this behind every Hermes `typeof f === "function"`
+// call guard. Source in nested_use.source.js, compiled with hermesc -O -g0
+// (HBC v99); the round trip corpus runs it (expressions/nested_use.js).
+#[test]
+fn a_value_read_deep_in_a_branch_keeps_its_definition() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let tmp = std::env::temp_dir().join(format!("hermes-e2e-nested-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let out = tmp.join("nested_use.js");
+    decompile(&dir.join("nested_use_v99.hbc"), &out).expect("decompile");
+    let js = std::fs::read_to_string(&out).expect("output");
+
+    // `load` is called once in each of `pick` and `other`, never dropped.
+    assert_eq!(
+        js.matches(".load()").count(),
+        2,
+        "each o.load() call must survive:\n{js}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 fn is_plain_ident(s: &str) -> bool {
     let mut chars = s.chars();
     chars
