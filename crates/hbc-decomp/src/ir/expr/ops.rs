@@ -101,6 +101,8 @@ pub enum UnaryOp {
     Not,
     TypeOf,
     Void,
+    // `delete x.y`: DelById/DelByVal produce a value the program may read.
+    Delete,
 }
 
 impl UnaryOp {
@@ -112,6 +114,7 @@ impl UnaryOp {
             UnaryOp::Not => "!",
             UnaryOp::TypeOf => "typeof ",
             UnaryOp::Void => "void ",
+            UnaryOp::Delete => "delete ",
         }
     }
 }

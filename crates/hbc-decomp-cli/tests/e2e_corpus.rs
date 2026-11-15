@@ -222,3 +222,28 @@ fn tracked_regression_fixtures_decompile() {
         failures.join("\n  ")
     );
 }
+
+// The boolean a `delete` produces was dropped: `var r = delete o.a` decompiled
+// to `delete arg0.a;` and a later `print(tmp)` read a name assigned nowhere.
+// Source in delete_result.source.js (hermesc v0.9.0 -O -g0, HBC 84).
+#[test]
+fn the_result_of_delete_is_kept() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let tmp = std::env::temp_dir().join(format!("hermes-e2e-delres-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let out = tmp.join("delete_result.js");
+    decompile(&dir.join("delete_result_v84.hbc"), &out).expect("decompile");
+    let js = std::fs::read_to_string(&out).expect("output");
+
+    // r1..r4 are read; `delete arr[1]` is not.
+    assert_eq!(
+        js.matches("= delete ").count(),
+        4,
+        "each read delete result must be bound:\n{js}"
+    );
+    assert!(
+        js.contains("delete arg1[1];"),
+        "an unused delete stays a statement:\n{js}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
