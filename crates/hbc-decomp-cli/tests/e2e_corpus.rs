@@ -222,3 +222,51 @@ fn tracked_regression_fixtures_decompile() {
         failures.join("\n  ")
     );
 }
+
+// A value assigned in both arms of an if/else and read after the join is one
+// binding and must keep one name at every site. The `${...}` hole of a
+// template literal was the one site the initializer-based rename skipped, so
+// the read after the join named a binding nothing declared and the output
+// threw `ReferenceError: tmp is not defined`. Source in branch_merge.source.js,
+// compiled with hermesc -O -g0 (HBC v99). The check is on names only, so it
+// holds whatever the opcode table makes of the comparisons; running the
+// output is the round trip corpus's job (expressions/branch_merge.js).
+#[test]
+fn a_value_merged_across_branches_keeps_one_name() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let tmp = std::env::temp_dir().join(format!("hermes-e2e-merge-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let out = tmp.join("branch_merge.js");
+    decompile(&dir.join("branch_merge_v99.hbc"), &out).expect("decompile");
+    let js = std::fs::read_to_string(&out).expect("output");
+
+    // Every identifier read in a template hole is declared somewhere.
+    let declared = |name: &str| {
+        ["let ", "const ", "var "]
+            .iter()
+            .any(|kw| js.contains(&format!("{kw}{name};")) || js.contains(&format!("{kw}{name} =")))
+            || js.contains(&format!("({name},"))
+            || js.contains(&format!(", {name})"))
+    };
+    let mut undeclared = Vec::new();
+    for hole in js.split("${").skip(1) {
+        let name = hole.split('}').next().unwrap_or_default();
+        if is_plain_ident(name) && !declared(name) {
+            undeclared.push(name.to_string());
+        }
+    }
+    assert!(
+        undeclared.is_empty(),
+        "template holes read undeclared names {undeclared:?}:\n{js}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+fn is_plain_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}

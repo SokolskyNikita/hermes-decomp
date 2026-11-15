@@ -330,4 +330,49 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert_ne!(names[0], names[1]);
     }
+
+    #[test]
+    fn a_rename_reaches_template_holes_and_destructuring_targets() {
+        // `s` is one binding assigned in both arms of an if/else and read after
+        // the join, so register naming hands it one name (`tmp`). The template
+        // initializer renames it to `text`; the rename must reach every site,
+        // the `${...}` read after the join included, or that read names a
+        // binding nothing declares (`let text1 = `${tmp}C``).
+        let var =
+            |n: &str| Expression::Value(Value::Binding(crate::ir::Binding::Variable(n.into())));
+        let assign = |n: &str, value: Expression| Statement::Assign {
+            target: AssignTarget::Binding(crate::ir::Binding::Variable(n.into())),
+            value,
+        };
+        let template =
+            |quasis: &[&str], expressions: Vec<Expression>| Expression::TemplateLiteral {
+                quasis: quasis.iter().map(|q| q.to_string()).collect(),
+                expressions,
+            };
+        let stmts = vec![
+            Statement::If {
+                condition: var("c"),
+                then_body: vec![assign("tmp", template(&["", "B"], vec![var("str")]))],
+                else_body: vec![assign("tmp", template(&["", "b"], vec![var("str")]))],
+            },
+            assign("out", template(&["", "C"], vec![var("tmp")])),
+            Statement::Assign {
+                target: AssignTarget::DestructuringArray(vec![Some((
+                    AssignTarget::Binding(crate::ir::Binding::Variable("tmp".into())),
+                    None,
+                ))]),
+                value: var("pair"),
+            },
+        ];
+        let rendered = infer_variable_names(stmts)
+            .iter()
+            .map(|s| format!("{s}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !rendered.contains("tmp"),
+            "every site of the renamed binding must follow it:\n{rendered}"
+        );
+        assert!(rendered.contains("${text}C"), "{rendered}");
+    }
 }

@@ -12,6 +12,10 @@ pub fn rename_stmt(namer: &VariableNamer, stmt: Statement) -> Statement {
             value: rename_expr(namer, value),
             kind,
         },
+        Statement::Delete { target, result } => Statement::Delete {
+            target: rename_expr(namer, target),
+            result,
+        },
         Statement::Expr(e) => Statement::Expr(rename_expr(namer, e)),
         Statement::Return(Some(e)) => Statement::Return(Some(rename_expr(namer, e))),
         Statement::Throw(e) => Statement::Throw(rename_expr(namer, e)),
@@ -152,8 +156,51 @@ fn rename_target(namer: &VariableNamer, target: AssignTarget) -> AssignTarget {
             object: rename_expr(namer, object),
             key: rename_expr(namer, key),
         },
-        other => other,
+        // The bindings a destructuring pattern writes, and its defaults.
+        AssignTarget::DestructuringObject(props) => {
+            AssignTarget::DestructuringObject(rename_object_pattern(namer, props))
+        }
+        AssignTarget::DestructuringObjectRest { properties, rest } => {
+            AssignTarget::DestructuringObjectRest {
+                properties: rename_object_pattern(namer, properties),
+                rest: Box::new(rename_target(namer, *rest)),
+            }
+        }
+        AssignTarget::DestructuringArray(elements) => {
+            AssignTarget::DestructuringArray(rename_array_pattern(namer, elements))
+        }
+        AssignTarget::DestructuringArrayRest { elements, rest } => {
+            AssignTarget::DestructuringArrayRest {
+                elements: rename_array_pattern(namer, elements),
+                rest: Box::new(rename_target(namer, *rest)),
+            }
+        }
+        AssignTarget::Rest(inner) => AssignTarget::Rest(Box::new(rename_target(namer, *inner))),
+        t @ AssignTarget::Binding(Binding::ClosureVar { .. }) => t,
     }
+}
+
+type ObjectPattern = Vec<(String, AssignTarget, Option<Expression>)>;
+type ArrayPattern = Vec<Option<(AssignTarget, Option<Expression>)>>;
+
+fn rename_object_pattern(namer: &VariableNamer, props: ObjectPattern) -> ObjectPattern {
+    props
+        .into_iter()
+        .map(|(k, t, def)| {
+            (
+                k,
+                rename_target(namer, t),
+                def.map(|e| rename_expr(namer, e)),
+            )
+        })
+        .collect()
+}
+
+fn rename_array_pattern(namer: &VariableNamer, elements: ArrayPattern) -> ArrayPattern {
+    elements
+        .into_iter()
+        .map(|e| e.map(|(t, def)| (rename_target(namer, t), def.map(|d| rename_expr(namer, d)))))
+        .collect()
 }
 
 fn rename_expr(namer: &VariableNamer, expr: Expression) -> Expression {
@@ -247,7 +294,43 @@ fn rename_expr(namer: &VariableNamer, expr: Expression) -> Expression {
             value: Box::new(rename_expr(namer, *value)),
             delegate,
         },
-        other => other,
+        // A template literal reads its interpolated values like any other
+        // expression. Skipping it renamed a binding at every site except the
+        // `${...}` holes, so a value merged across if/else arms (one SSA
+        // class, one name) read an undefined name after the join:
+        // `let text = `${str}B`` in the arms, then `${tmp}C` below.
+        Expression::TemplateLiteral {
+            quasis,
+            expressions,
+        } => Expression::TemplateLiteral {
+            quasis,
+            expressions: expressions
+                .into_iter()
+                .map(|e| rename_expr(namer, e))
+                .collect(),
+        },
+        Expression::JSXElement {
+            tag,
+            attributes,
+            children,
+        } => Expression::JSXElement {
+            tag,
+            attributes: attributes
+                .into_iter()
+                .map(|(k, v)| (k, rename_expr(namer, v)))
+                .collect(),
+            children: children
+                .into_iter()
+                .map(|c| rename_expr(namer, c))
+                .collect(),
+        },
+        // Listed rather than caught by a wildcard, so a new expression kind is
+        // a compile error here instead of a silently half-renamed binding.
+        // Function bodies are renamed per function, not from the outer scope.
+        e @ (Expression::Value(_)
+        | Expression::Function { .. }
+        | Expression::RegExp { .. }
+        | Expression::Unknown { .. }) => e,
     }
 }
 
