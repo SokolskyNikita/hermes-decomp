@@ -94,9 +94,7 @@ fn collect_loop_body(
     // so the walk above never reaches it), as long as the header dominates
     // them: a try that encloses the whole loop stays outside.
     for pred in cfg.exception_edge_sources(node) {
-        let in_loop = dominators
-            .get(&pred)
-            .is_some_and(|d| d.contains(&header));
+        let in_loop = dominators.get(&pred).is_some_and(|d| d.contains(&header));
         if pred != header && in_loop {
             collect_loop_body(cfg, dominators, pred, header, body);
         }
@@ -107,25 +105,23 @@ fn find_loop_exit(cfg: &CFG, header: BlockId, body: &BTreeSet<BlockId>) -> Optio
     if let Some(exit) = common_loop_exit(cfg, body) {
         return Some(exit);
     }
-    if let Some(block) = cfg.get(header) {
-        for succ in block.successors() {
-            if !body.contains(&succ) {
-                return Some(succ);
-            }
+    // The first exit in block order, the header's own first. A block that
+    // only throws is taken only when there is nothing else.
+    let mut candidates: Vec<BlockId> = Vec::new();
+    for b in std::iter::once(header).chain(body.iter().copied()) {
+        if let Some(block) = cfg.get(b) {
+            candidates.extend(block.successors().into_iter().filter(|s| !body.contains(s)));
         }
     }
-
-    for &block_id in body {
-        if let Some(block) = cfg.get(block_id) {
-            for succ in block.successors() {
-                if !body.contains(&succ) {
-                    return Some(succ);
-                }
-            }
-        }
-    }
-
-    None
+    let throws = |b: &BlockId| {
+        cfg.get(*b)
+            .is_some_and(|blk| matches!(blk.terminator, Terminator::Throw(_)))
+    };
+    candidates
+        .iter()
+        .find(|b| !throws(b))
+        .or(candidates.first())
+        .copied()
 }
 
 // When the loop leaves through several blocks and all of them flow into one
@@ -144,6 +140,20 @@ fn common_loop_exit(cfg: &CFG, body: &BTreeSet<BlockId>) -> Option<BlockId> {
                 }
             }
         }
+    }
+    // An exit block that only throws is not where the loop goes on to: with
+    // it picked as the exit, `default: throw ..` in a loop's switch became
+    // the code after the loop and the real exit became the throw's `break`.
+    let before = exits.len();
+    let throws = |b: BlockId| {
+        cfg.get(b)
+            .is_some_and(|blk| matches!(blk.terminator, Terminator::Throw(_)))
+    };
+    if exits.iter().any(|&e| !throws(e)) {
+        exits.retain(|&e| !throws(e));
+    }
+    if exits.len() == 1 && before > 1 {
+        return Some(exits[0]);
     }
     if exits.len() < 2 {
         return None;
@@ -164,10 +174,31 @@ fn common_loop_exit(cfg: &CFG, body: &BTreeSet<BlockId>) -> Option<BlockId> {
         }
         false
     };
-    exits
+    if let Some(e) = exits
         .iter()
         .copied()
         .find(|&e| exits.iter().all(|&o| o == e || reaches(o, e)))
+    {
+        return Some(e);
+    }
+    // No exit is reached from all the others, but they may still meet
+    // outside the loop: `if (sib) { ..; return } .. while (c)` leaves through
+    // two blocks that both fall into the function's one `return`. That join
+    // is the exit, and the two paths to it become the loop's `break`s.
+    let mut seen: HashSet<BlockId> = HashSet::new();
+    let mut queue = std::collections::VecDeque::from([exits[0]]);
+    while let Some(n) = queue.pop_front() {
+        if body.contains(&n) || !seen.insert(n) {
+            continue;
+        }
+        if exits.iter().all(|&o| reaches(o, n)) {
+            return Some(n);
+        }
+        if let Some(block) = cfg.get(n) {
+            queue.extend(block.successors());
+        }
+    }
+    None
 }
 
 pub fn compute_dominators(cfg: &CFG) -> BTreeMap<BlockId, HashSet<BlockId>> {

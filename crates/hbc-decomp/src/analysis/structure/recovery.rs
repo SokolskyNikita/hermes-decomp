@@ -51,8 +51,7 @@ pub fn analyze(cfg: &CFG) -> (Structure, Vec<LoopInfo>) {
     // (usually the real catch). Keep them all and nest them: the handler that
     // protects more blocks encloses the others. On a tie, the handler listed
     // later in the table is the outer one, as Hermes lists inner handlers first.
-    let mut try_starts: BTreeMap<BlockId, Vec<&crate::ir::CfgExceptionHandler>> =
-        BTreeMap::new();
+    let mut try_starts: BTreeMap<BlockId, Vec<&crate::ir::CfgExceptionHandler>> = BTreeMap::new();
     for handler in &cfg.exception_handlers {
         if let Some(h) = earliest_for_catch.get(&handler.catch_block) {
             if std::ptr::eq(*h, handler) {
@@ -65,9 +64,8 @@ pub fn analyze(cfg: &CFG) -> (Structure, Vec<LoopInfo>) {
     }
     for handlers in try_starts.values_mut() {
         handlers.reverse();
-        handlers.sort_by_key(|h| {
-            std::cmp::Reverse(cfg.exception_edge_sources(h.catch_block).len())
-        });
+        handlers
+            .sort_by_key(|h| std::cmp::Reverse(cfg.exception_edge_sources(h.catch_block).len()));
     }
 
     let mut ctx = RecoveryCtx {
@@ -76,6 +74,7 @@ pub fn analyze(cfg: &CFG) -> (Structure, Vec<LoopInfo>) {
         visited: &mut visited,
         try_starts: &try_starts,
         plain_header: None,
+        switch_loop_depth: None,
     };
 
     let root = recover_structure(&mut ctx, cfg.entry, &loop_stack);
@@ -91,19 +90,11 @@ pub(super) fn recover_structure(
         // If we're jumping to a loop header we're in, it's a continue
         for (i, loop_info) in loop_stack.iter().enumerate().rev() {
             if block_id == loop_info.header {
-                let label = if i < loop_stack.len() - 1 {
-                    Some(format!("label{i}"))
-                } else {
-                    None
-                };
+                let label = ctx.loop_label(i, loop_stack.len(), false);
                 return Structure::Continue(label);
             }
             if loop_info.exit == Some(block_id) {
-                let label = if i < loop_stack.len() - 1 {
-                    Some(format!("label{i}"))
-                } else {
-                    None
-                };
+                let label = ctx.loop_label(i, loop_stack.len(), true);
                 return Structure::Break(label);
             }
         }
@@ -164,11 +155,11 @@ pub(super) fn recover_try(
             .collect();
         let exit = try_region_exit(ctx.cfg, &region, catch_block_id, loop_stack.last().copied())
             .filter(|e| {
-            !ctx.visited.contains(e)
-                && !loop_stack
-                    .iter()
-                    .any(|l| l.header == *e || l.exit == Some(*e))
-        });
+                !ctx.visited.contains(e)
+                    && !loop_stack
+                        .iter()
+                        .any(|l| l.header == *e || l.exit == Some(*e))
+            });
         if let Some(exit) = exit {
             ctx.visited.insert(exit);
         }
@@ -191,14 +182,14 @@ pub(super) fn recover_try(
             catch_param,
             catch_body: Box::new(catch_body),
         };
-        return match exit {
+        match exit {
             Some(exit) => {
                 ctx.visited.remove(&exit);
                 let after = recover_structure(ctx, exit, loop_stack);
                 Structure::Sequence(vec![try_catch, after])
             }
             None => try_catch,
-        };
+        }
     }
 }
 
@@ -210,19 +201,11 @@ pub(super) fn recover_structure_inner(
     if ctx.visited.contains(&block_id) {
         for (i, loop_info) in loop_stack.iter().enumerate().rev() {
             if block_id == loop_info.header {
-                let label = if i < loop_stack.len() - 1 {
-                    Some(format!("label{i}"))
-                } else {
-                    None
-                };
+                let label = ctx.loop_label(i, loop_stack.len(), false);
                 return Structure::Continue(label);
             }
             if loop_info.exit == Some(block_id) {
-                let label = if i < loop_stack.len() - 1 {
-                    Some(format!("label{i}"))
-                } else {
-                    None
-                };
+                let label = ctx.loop_label(i, loop_stack.len(), true);
                 return Structure::Break(label);
             }
         }
@@ -273,21 +256,13 @@ pub(super) fn recover_structure_inner(
             // control flow (HBC96 reference bundle: 1268 such comments).
             for (i, loop_info) in loop_stack.iter().enumerate().rev() {
                 if target == loop_info.header && ctx.visited.contains(&target) {
-                    let label = if i < loop_stack.len() - 1 {
-                        Some(format!("label{i}"))
-                    } else {
-                        None
-                    };
+                    let label = ctx.loop_label(i, loop_stack.len(), false);
                     let mut stmts = stmts;
                     stmts.push(Statement::Continue(label));
                     return Structure::Block(block_id, stmts);
                 }
                 if loop_info.exit == Some(target) {
-                    let label = if i < loop_stack.len() - 1 {
-                        Some(format!("label{i}"))
-                    } else {
-                        None
-                    };
+                    let label = ctx.loop_label(i, loop_stack.len(), true);
                     let mut stmts = stmts;
                     stmts.push(Statement::Break(label));
                     return Structure::Block(block_id, stmts);
@@ -317,7 +292,11 @@ pub(super) fn recover_structure_inner(
                     let else_ = recover_structure(ctx, false_target, loop_stack);
                     parts.push(Structure::If {
                         condition: condition.clone(),
-                        then_: Box::new(Structure::Break(None)),
+                        then_: Box::new(Structure::Break(ctx.loop_label(
+                            loop_stack.len() - 1,
+                            loop_stack.len(),
+                            true,
+                        ))),
                         else_: Box::new(else_),
                     });
                     return Structure::Sequence(parts);
@@ -328,7 +307,11 @@ pub(super) fn recover_structure_inner(
                     let then_ = recover_structure(ctx, true_target, loop_stack);
                     parts.push(Structure::If {
                         condition: Expression::unary(crate::ir::UnaryOp::Not, condition.clone()),
-                        then_: Box::new(Structure::Break(None)),
+                        then_: Box::new(Structure::Break(ctx.loop_label(
+                            loop_stack.len() - 1,
+                            loop_stack.len(),
+                            true,
+                        ))),
                         else_: Box::new(then_),
                     });
                     return Structure::Sequence(parts);
@@ -392,6 +375,22 @@ pub(super) fn recover_structure_inner(
             let default = *default;
             let mut parts = vec![Structure::Block(block_id, stmts)];
 
+            // Recover each case only up to the block the cases rejoin at, and
+            // emit that block after the switch. Without it the common tail
+            // went into the first case that reached it and every other case
+            // ended at the switch, skipping the tail (in a loop, the code
+            // that moves to the next iteration).
+            let mut targets: Vec<BlockId> = cases.iter().map(|(_, t)| *t).collect();
+            targets.push(default);
+            let merge = find_switch_merge(ctx.cfg, block_id, &targets, loop_stack.last().copied())
+                .filter(|m| !ctx.visited.contains(m));
+            if let Some(m) = merge {
+                ctx.visited.insert(m);
+            }
+            // A `break` to the innermost loop's exit from a case would only
+            // leave the switch: such breaks carry the loop's label.
+            let saved_depth = ctx.switch_loop_depth.replace(loop_stack.len());
+
             let mut recovered: BTreeMap<BlockId, Structure> = BTreeMap::new();
             for (_case_val, target) in &cases {
                 if !recovered.contains_key(target) {
@@ -410,12 +409,17 @@ pub(super) fn recover_structure_inner(
             } else {
                 recover_structure(ctx, default, loop_stack)
             };
+            ctx.switch_loop_depth = saved_depth;
 
             parts.push(Structure::Switch {
                 discriminant: value,
                 cases: switch_cases,
                 default: Box::new(default_body),
             });
+            if let Some(m) = merge {
+                ctx.visited.remove(&m);
+                parts.push(recover_structure(ctx, m, loop_stack));
+            }
 
             Structure::Sequence(parts)
         }
@@ -427,6 +431,61 @@ pub(super) fn recover_structure_inner(
             Structure::Block(block_id, stmts)
         }
     }
+}
+
+// The block the cases of a switch rejoin at: of the blocks reachable from the
+// case targets (without passing back through the switch), the one reached
+// from the most targets, nearest to the switch on a tie. Cases that end by
+// returning or throwing reach nothing and do not count. Inside a loop, walks
+// stop at the loop's header and at blocks outside the loop, and those are
+// never the merge: a case reaching them ends in `continue`/`break`. None when
+// fewer than two targets share a block.
+fn find_switch_merge(
+    cfg: &CFG,
+    switch: BlockId,
+    targets: &[BlockId],
+    innermost_loop: Option<&LoopInfo>,
+) -> Option<BlockId> {
+    use std::collections::VecDeque;
+    let in_scope = |b: BlockId| innermost_loop.is_none_or(|l| b != l.header && l.body.contains(&b));
+    let mut distinct: Vec<BlockId> = Vec::new();
+    for &t in targets {
+        if !distinct.contains(&t) {
+            distinct.push(t);
+        }
+    }
+    let mut count: BTreeMap<BlockId, usize> = BTreeMap::new();
+    for &t in &distinct {
+        let mut seen: HashSet<BlockId> = HashSet::new();
+        let mut stack = vec![t];
+        while let Some(n) = stack.pop() {
+            if n == switch || !in_scope(n) || !seen.insert(n) {
+                continue;
+            }
+            if let Some(blk) = cfg.get(n) {
+                stack.extend(blk.successors());
+            }
+        }
+        for n in seen {
+            *count.entry(n).or_default() += 1;
+        }
+    }
+    let best = count.values().copied().max().filter(|&c| c >= 2)?;
+    // Nearest block with the best count, breadth-first from the switch.
+    let mut seen: HashSet<BlockId> = HashSet::new();
+    let mut queue: VecDeque<BlockId> = distinct.iter().copied().collect();
+    while let Some(n) = queue.pop_front() {
+        if n == switch || !in_scope(n) || !seen.insert(n) {
+            continue;
+        }
+        if count.get(&n) == Some(&best) {
+            return Some(n);
+        }
+        if let Some(blk) = cfg.get(n) {
+            queue.extend(blk.successors());
+        }
+    }
+    None
 }
 
 // Find the merge (join) point of a branch: the nearest block reachable from
@@ -490,12 +549,13 @@ fn try_region_exit(
     // kept inside the try, it fell under this handler and ran the finally body
     // a second time when it threw.
     let catch_reach = reach(catch);
-    let catch_always_throws = !catch_reach.is_empty() && catch_reach.iter().all(|&b| {
-        cfg.get(b).is_some_and(|block| {
-            !matches!(block.terminator, Terminator::Return(_) | Terminator::None)
-                && block.successors().iter().all(|&s| in_scope(s))
-        })
-    });
+    let catch_always_throws = !catch_reach.is_empty()
+        && catch_reach.iter().all(|&b| {
+            cfg.get(b).is_some_and(|block| {
+                !matches!(block.terminator, Terminator::Return(_) | Terminator::None)
+                    && block.successors().iter().all(|&s| in_scope(s))
+            })
+        });
     match exits.as_slice() {
         [] => None,
         [only] if catch_reach.contains(only) || catch_always_throws => Some(*only),
