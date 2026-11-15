@@ -24,6 +24,8 @@ pub mod ssa;
 pub mod ternary_returns;
 mod var_kind;
 pub mod var_naming;
+mod iterator_lower;
+pub use iterator_lower::lower_iterator_protocol;
 pub mod worklet_source;
 
 pub use chain_access::optimize_chain_access;

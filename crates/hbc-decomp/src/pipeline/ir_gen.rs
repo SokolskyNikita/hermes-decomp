@@ -148,6 +148,10 @@ pub fn generate_ir(
         let statements = transforms::data_flow::propagate_concatenation(statements);
         // STAGE F10: Pattern Detection (string concat, nullish, optional chaining, short-circuit)
         let statements = detect_patterns(statements);
+        // Iterator steps no pattern matcher consumed (destructuring with defaults/rest,
+        // nested destructuring in loops, ...) become plain JS that honours
+        // IteratorNext's contract (`iter = undefined` when done, value not record).
+        let statements = transforms::lower_iterator_protocol(statements);
 
         // STAGE F11: Class Pattern Detection (ES6 class reconstruction)
         let statements = detect_class_patterns(statements, file, format, options, closure_ctx);
