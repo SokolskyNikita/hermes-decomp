@@ -404,6 +404,9 @@ impl Codegen {
         // cannot simply be promoted: the export takes a private binding and is
         // published under the name it always had.
         dedupe_const_export_collisions(&imports, &mut body_stmts, &mut exports);
+        // The same for `export function X` next to an import or a module-level
+        // `const X = dep.X`, which a destructured import comes out as.
+        dedupe_function_decl_export_collisions(&imports, &body_stmts, &mut exports);
 
         // A hoisted `let X;` in front of a `class X` or `function X` redeclares it,
         // which a parser rejects and takes the whole module down with it. The hoist
@@ -908,6 +911,21 @@ mod const_export_tests {
         dedupe_const_export_collisions(&[], &mut body, &mut exports);
         assert_eq!(exports, before);
         assert_eq!(body.len(), 1, "nothing should be appended");
+    }
+
+    #[test]
+    fn a_named_function_value_takes_the_alias_as_its_own_name() {
+        // Keeping `function useTheme` inside would make the inner read the
+        // function itself instead of the local it collides with.
+        let mut body = v(&["const useTheme = theming.useTheme;\n"]);
+        let mut exports =
+            v(&["export const useTheme = function useTheme(a) {\n  return useTheme(a);\n};"]);
+        dedupe_const_export_collisions(&[], &mut body, &mut exports);
+        assert_eq!(exports, v(&["export { useTheme_export as useTheme };"]));
+        assert_eq!(
+            body[1],
+            "const useTheme_export = function useTheme_export(a) {\n  return useTheme(a);\n};\n"
+        );
     }
 
     #[test]
@@ -1431,8 +1449,183 @@ fn dedupe_const_export_collisions(
             n += 1;
         }
         declared.insert(alias.clone());
+        // `export const X = function X() { X() }` keeps its own name inside the
+        // function, where it would shadow the colliding local the body reads
+        // (`const X_export = function X() { return X(); }` recurses forever).
+        // The function expression takes the alias as its name too.
+        let value = [
+            "function ",
+            "function* ",
+            "async function ",
+            "async function* ",
+        ]
+        .iter()
+        .find_map(|kw| {
+            let rest = value.strip_prefix(*kw)?.strip_prefix(name.as_str())?;
+            rest.starts_with('(').then(|| format!("{kw}{alias}{rest}"))
+        })
+        .unwrap_or_else(|| value.to_string());
         extra.push(format!("const {alias} = {value};\n"));
         *exp = format!("export {{ {alias} as {name} }};");
     }
     body_stmts.extend(extra);
+}
+
+// The names bound at the top level of the module: every import binding, and each
+// declaration in the body that starts a line with no indentation. A name declared
+// only inside a nested body is not counted, since it does not collide with a
+// module-level declaration.
+fn module_level_bindings(
+    imports: &[String],
+    body_stmts: &[String],
+) -> std::collections::HashSet<String> {
+    let mut declared = std::collections::HashSet::new();
+    for line in imports {
+        declared.extend(import_bound_names(line));
+    }
+    for line in body_stmts.iter().flat_map(|b| b.lines()) {
+        if line.starts_with(char::is_whitespace) || line.starts_with("export ") {
+            continue;
+        }
+        let Some((kw, rest)) = [
+            "const ",
+            "let ",
+            "var ",
+            "class ",
+            "async function ",
+            "function ",
+        ]
+        .iter()
+        .find_map(|kw| line.strip_prefix(*kw).map(|r| (*kw, r))) else {
+            continue;
+        };
+        let rest = rest.trim_start_matches('*').trim_start();
+        // A bare hoist can bind several names at once: `let a, b;`.
+        if (kw == "let " || kw == "var ") && !rest.contains('=') {
+            for name in rest.trim_end().trim_end_matches(';').split(',') {
+                let name = name.trim();
+                if crate::util::is_valid_identifier(name) {
+                    declared.insert(name.to_string());
+                }
+            }
+            continue;
+        }
+        if let Some(name) = rest
+            .split(|c: char| c == '=' || c == ';' || c == '(' || c == '{' || c.is_whitespace())
+            .next()
+        {
+            if crate::util::is_valid_identifier(name) {
+                declared.insert(name.to_string());
+            }
+        }
+    }
+    declared
+}
+
+// Resolve `export function X` colliding with a module-level binding of X.
+//
+// `exports.X = function X() {}` is emitted as `export function X`, but the module
+// may already bind X: an import, or the local a destructured import comes out as
+// (`const useTheme = theming.useTheme;`). That binds X twice at module level, and
+// the parser rejects the whole module. The function takes a private name and is
+// published under the one it always had. Only the declaration is renamed: a read of
+// X elsewhere in the module, inside the function included, keeps meaning the
+// binding that was there first, which is the one the bytecode read through the
+// module scope.
+fn dedupe_function_decl_export_collisions(
+    imports: &[String],
+    body_stmts: &[String],
+    exports: &mut [String],
+) {
+    const HEADS: [&str; 4] = [
+        "export async function* ",
+        "export async function ",
+        "export function* ",
+        "export function ",
+    ];
+    let mut declared = module_level_bindings(imports, body_stmts);
+    if declared.is_empty() {
+        return;
+    }
+    for exp in exports.iter_mut() {
+        let Some(head) = HEADS.iter().find(|h| exp.starts_with(**h)) else {
+            continue;
+        };
+        let rest = &exp[head.len()..];
+        let Some(paren) = rest.find('(') else {
+            continue;
+        };
+        let name = rest[..paren].trim().to_string();
+        if !declared.contains(&name) {
+            continue;
+        }
+        let mut alias = format!("{name}_export");
+        let mut n = 2u32;
+        while declared.contains(&alias) {
+            alias = format!("{name}_export{n}");
+            n += 1;
+        }
+        declared.insert(alias.clone());
+        let decl = format!(
+            "{}{alias}{}",
+            &head["export ".len()..],
+            rest[paren..].trim_end()
+        );
+        *exp = format!("{decl}\nexport {{ {alias} as {name} }};");
+    }
+}
+
+#[cfg(test)]
+mod function_export_tests {
+    use super::dedupe_function_decl_export_collisions;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    #[test]
+    fn an_exported_function_colliding_with_a_local_takes_a_private_name() {
+        // `const useTheme = theming.useTheme` plus `export function useTheme`
+        // binds the name twice. The call inside keeps reading the local.
+        let body = v(&["const useTheme = theming.useTheme;\n"]);
+        let mut exports = v(&["export function useTheme(arg0) {\n  return useTheme(arg0);\n}"]);
+        dedupe_function_decl_export_collisions(&[], &body, &mut exports);
+        assert_eq!(
+            exports,
+            v(&[
+                "function useTheme_export(arg0) {\n  return useTheme(arg0);\n}\n\
+                 export { useTheme_export as useTheme };"
+            ])
+        );
+    }
+
+    #[test]
+    fn an_exported_function_colliding_with_an_import_or_hoist_is_renamed() {
+        let imports = v(&["import min from \"min\";"]);
+        let body = v(&["let error, warn;\n"]);
+        let mut exports = v(&[
+            "export function min() {\n}",
+            "export async function* error(a) {\n}",
+            "export function warn2(a) {\n}",
+        ]);
+        dedupe_function_decl_export_collisions(&imports, &body, &mut exports);
+        assert_eq!(
+            exports[0],
+            "function min_export() {\n}\nexport { min_export as min };"
+        );
+        assert_eq!(
+            exports[1],
+            "async function* error_export(a) {\n}\nexport { error_export as error };"
+        );
+        assert_eq!(exports[2], "export function warn2(a) {\n}");
+    }
+
+    #[test]
+    fn a_name_declared_only_in_a_nested_body_is_not_a_collision() {
+        let body = v(&["function outer() {\n  let map = 1;\n}\n"]);
+        let before = v(&["export function map(a) {\n}"]);
+        let mut exports = before.clone();
+        dedupe_function_decl_export_collisions(&[], &body, &mut exports);
+        assert_eq!(exports, before);
+    }
 }
