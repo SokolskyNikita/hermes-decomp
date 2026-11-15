@@ -409,3 +409,23 @@ fn tracked_regression_fixtures_round_trip() {
         failures.join("\n  ")
     );
 }
+
+// An ES5 class inside an IIFE (TypeScript / Babel loose output, e.g. Amplify's
+// Credentials) is rendered from the first inline pass. The fn-ref walk did not
+// enter class methods, so the class was never re-rendered once its methods'
+// callbacks were filled in and HBC 84 printed `/* body not rendered */` for
+// every callback. Source in class_methods.source.js (hermesc v84 -O -g0); the
+// round trip test runs it under node.
+#[test]
+fn callbacks_in_class_methods_inside_an_iife_are_rendered() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let tmp = std::env::temp_dir().join(format!("hermes-e2e-clsm-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let out = tmp.join("class_methods_v84.js");
+    decompile(&dir.join("class_methods_v84.hbc"), &out).expect("decompile");
+    let js = std::fs::read_to_string(&out).expect("output");
+    assert!(!js.contains("body not rendered"), "hole left in a class method:\n{js}");
+    assert!(js.contains("+ \"!\""), "map callback missing:\n{js}");
+    assert!(js.contains(".configure("), "forEach callback missing:\n{js}");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
