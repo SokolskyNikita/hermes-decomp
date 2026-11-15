@@ -33,8 +33,29 @@ use super::DecompileOptionsV2;
 pub const CACHE_VERSION: u32 = 5;
 const MAGIC: [u8; 4] = *b"HDC1";
 
-// Standard cache path for an input file: `<input>.hdcache` next to it.
+// Standard cache path for an input file: `<input>.hdcache` next to it, or, when
+// `HERMES_DECOMP_CACHE_DIR` is set, `<dir>/<sha256 of the input, 16 hex>.hdcache`.
+// The directory form keeps caches out of folders that must stay as they are (an
+// output tree the decompiler reads from), and keys by content, so every copy of
+// one bundle shares one cache file. An unreadable input falls back to the
+// next-to-input path.
 pub fn default_cache_path(input: &Path) -> PathBuf {
+    if let Some(dir) = std::env::var_os("HERMES_DECOMP_CACHE_DIR").filter(|d| !d.is_empty()) {
+        if let Ok(bytes) = std::fs::read(input) {
+            return cache_path_in_dir(Path::new(&dir), &bytes);
+        }
+    }
+    cache_path_next_to(input)
+}
+
+// `<dir>/<sha256 of bytes, first 16 hex digits>.hdcache`.
+fn cache_path_in_dir(dir: &Path, bytes: &[u8]) -> PathBuf {
+    let hash = hash_bytes(bytes);
+    let hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+    dir.join(format!("{hex}.hdcache"))
+}
+
+fn cache_path_next_to(input: &Path) -> PathBuf {
     let mut name = input
         .file_name()
         .map(|n| n.to_os_string())
@@ -287,6 +308,18 @@ mod tests {
         let back: crate::analysis::closure::ClosureContext =
             rmp_serde::decode::from_slice(&bytes).expect("decode");
         assert_eq!(back.slot_owner(7, 130), Some(scope));
+    }
+
+    #[test]
+    fn cache_dir_path_is_keyed_by_content() {
+        let dir = Path::new("/tmp/hdc");
+        let a = cache_path_in_dir(dir, b"bundle one");
+        assert_eq!(a, cache_path_in_dir(dir, b"bundle one"));
+        assert_ne!(a, cache_path_in_dir(dir, b"bundle two"));
+        assert_eq!(a.parent(), Some(dir));
+        let name = a.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name.len(), 16 + ".hdcache".len());
+        assert!(name.ends_with(".hdcache"));
     }
 
     #[test]
