@@ -123,4 +123,25 @@ mod tests {
         assert!(file.function_headers[0].offset() > 0);
         assert_eq!(file.strings.len(), 2);
     }
+
+    // HBC 99 drops the NumCacheNewObject byte from the large header, so the
+    // flags byte moves up by one. The global must still come back callable.
+    #[test]
+    fn create_minimal_v99_parses() {
+        let bytes = create_minimal(&CreateOptions {
+            version: 99,
+            global_body: Vec::new(),
+            strings: vec!["global".into(), "hello".into()],
+        })
+        .expect("create v99");
+        assert!(verify_footer(&bytes));
+        let file = BytecodeFile::parse_auto(&bytes).expect("parse created v99 file");
+        assert_eq!(file.header.version, 99);
+        let crate::format::FunctionHeader::Modern(global) = &file.function_headers[0] else {
+            panic!("expected a modern header");
+        };
+        assert!(global.offset > 0);
+        assert_eq!(global.flags & 0b11, 0b10, "ProhibitNone");
+        assert_eq!(global.num_cache_new_object, 0);
+    }
 }

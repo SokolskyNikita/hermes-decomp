@@ -289,7 +289,7 @@ pub fn build_minimal_modern(
 
     // Out-of-line large header (FunctionInfo), 4 byte aligned. Field order matches
     // the parser: offset, param, loop_depth, size, name, numReg, nonPtrReg, frame,
-    // then read/write/newObj/privateName caches and the flags byte.
+    // then the cache sizes and the flags byte.
     let large_header_pos = buf.len() as u32;
     let large: [u32; 8] = [
         instruction_offset,       // body offset
@@ -304,11 +304,14 @@ pub fn build_minimal_modern(
     for v in large {
         buf.extend_from_slice(&v.to_le_bytes());
     }
-    // read/write/newObj/private caches = 0, then the flags byte. In Hermes the low
-    // two bits are ProhibitInvoke where 0 means ProhibitCall (must use `new`), so a
-    // plain callable global needs ProhibitNone, value 2.
+    // read/write/newObj/private caches = 0, then the flags byte. HBC 99 has no
+    // newObj cache byte. In Hermes the low two bits are ProhibitInvoke where 0
+    // means ProhibitCall (must use `new`), so a plain callable global needs
+    // ProhibitNone, value 2.
     const PROHIBIT_NONE: u8 = 0b10;
-    buf.extend_from_slice(&[0u8, 0, 0, 0, PROHIBIT_NONE]);
+    let cache_bytes = if version >= 99 { 3 } else { 4 };
+    buf.extend_from_slice(&[0u8; 4][..cache_bytes]);
+    buf.push(PROHIBIT_NONE);
     align4(&mut buf);
 
     // Small header points at the large header. large_ptr = (name << 24) | (ptr &
