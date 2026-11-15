@@ -1,4 +1,5 @@
 use crate::ir::{stmt_uses_register, AssignTarget, Binding, Expression, Statement, Value};
+use std::collections::HashMap;
 
 pub(super) fn remove_dead_assignments(stmts: Vec<Statement>) -> Vec<Statement> {
     // A store `X = value` is dead when, scanning forward in this flat sequence, a
@@ -9,10 +10,11 @@ pub(super) fn remove_dead_assignments(stmts: Vec<Statement>) -> Vec<Statement> {
     // dead store of a side-effecting call keeps the call and drops the target.
     let n = stmts.len();
     let mut dead: Vec<bool> = vec![false; n];
+    let index = OverwriteIndex::new(&stmts);
     for (i, stmt) in stmts.iter().enumerate() {
         if let Statement::Assign { target, .. } = stmt {
             if let Some(key) = target_key(target) {
-                if overwritten_before_read(&stmts, i + 1, &key) {
+                if index.overwritten_before_read(&stmts, i + 1, &key) {
                     dead[i] = true;
                 }
             }
@@ -163,6 +165,70 @@ fn is_literal_data(e: &Expression) -> bool {
 // overwritten by a full store before any statement reads it. Stops (returning
 // false, i.e. treat as live) at the first control-flow statement, since a branch
 // could read the value.
+// Positions of every overwrite (per key) and every control-flow statement in one
+// flat list, so `overwritten_before_read` only scans for reads up to the next
+// overwrite of the same key instead of to the end of the straight-line run. Same
+// answer as the plain forward scan: the scan can only return true at the first
+// overwrite, and only if no statement up to and including it reads the key and
+// no control-flow statement comes first.
+struct OverwriteIndex {
+    regs: HashMap<u32, Vec<usize>>,
+    vars: HashMap<String, Vec<usize>>,
+    barriers: Vec<usize>,
+}
+
+impl OverwriteIndex {
+    fn new(stmts: &[Statement]) -> Self {
+        let mut index = OverwriteIndex {
+            regs: HashMap::new(),
+            vars: HashMap::new(),
+            barriers: Vec::new(),
+        };
+        for (j, stmt) in stmts.iter().enumerate() {
+            if !is_straight_line(stmt) {
+                index.barriers.push(j);
+                continue;
+            }
+            match stmt {
+                Statement::Assign {
+                    target: AssignTarget::Binding(Binding::Register(r)),
+                    ..
+                } => index.regs.entry(*r).or_default().push(j),
+                Statement::Assign {
+                    target: AssignTarget::Binding(Binding::Variable(name)),
+                    ..
+                }
+                | Statement::Let { name, .. } => {
+                    index.vars.entry(name.clone()).or_default().push(j)
+                }
+                _ => {}
+            }
+        }
+        index
+    }
+
+    fn overwritten_before_read(&self, stmts: &[Statement], start: usize, key: &Key) -> bool {
+        let positions = match key {
+            Key::Reg(r) => self.regs.get(r),
+            Key::Var(name) => self.vars.get(name),
+        };
+        let Some(positions) = positions else {
+            return false;
+        };
+        let Some(&o) = positions.get(positions.partition_point(|&j| j < start)) else {
+            return false;
+        };
+        if let Some(&b) = self.barriers.get(self.barriers.partition_point(|&j| j < start)) {
+            if b < o {
+                return false;
+            }
+        }
+        debug_assert!(overwrites(&stmts[o], key));
+        !stmts[start..=o].iter().any(|stmt| uses_key(stmt, key))
+    }
+}
+
+#[cfg(test)]
 fn overwritten_before_read(stmts: &[Statement], start: usize, key: &Key) -> bool {
     for stmt in &stmts[start..] {
         if !is_straight_line(stmt) {
@@ -266,6 +332,84 @@ mod tests {
                 name.into(),
             )))),
             arguments: vec![Expression::Value(Value::Constant(Constant::Integer(0)))],
+        }
+    }
+
+    // The indexed check must agree with the plain forward scan at every position
+    // of random flat lists mixing register/variable stores, reads, `let`s and
+    // control flow.
+    #[test]
+    fn indexed_check_matches_forward_scan() {
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |n: u64| -> u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let names = ["a", "b", "c"];
+        for _case in 0..400 {
+            let len = next(30) as usize;
+            let read = |next: &mut dyn FnMut(u64) -> u64| -> Expression {
+                if next(2) == 0 {
+                    Expression::Value(Value::Binding(Binding::Register(next(3) as u32)))
+                } else {
+                    Expression::Value(Value::Binding(Binding::Variable(
+                        names[next(3) as usize].into(),
+                    )))
+                }
+            };
+            let mut stmts = Vec::new();
+            for _ in 0..len {
+                let value = if next(3) == 0 {
+                    read(&mut next)
+                } else {
+                    Expression::Value(Value::Constant(Constant::Integer(1)))
+                };
+                stmts.push(match next(6) {
+                    0 => Statement::Assign {
+                        target: AssignTarget::Binding(Binding::Register(next(3) as u32)),
+                        value,
+                    },
+                    1 => Statement::Assign {
+                        target: AssignTarget::Binding(Binding::Variable(
+                            names[next(3) as usize].into(),
+                        )),
+                        value,
+                    },
+                    2 => Statement::Let {
+                        name: names[next(3) as usize].into(),
+                        value,
+                        kind: crate::ir::VarKind::Let,
+                    },
+                    3 => Statement::Expr(value),
+                    4 => Statement::Return(Some(value)),
+                    _ => Statement::Assign {
+                        target: AssignTarget::Member {
+                            object: read(&mut next),
+                            property: "k".into(),
+                        },
+                        value,
+                    },
+                });
+            }
+            let index = OverwriteIndex::new(&stmts);
+            for start in 0..=stmts.len() {
+                let keys = [
+                    Key::Reg(0),
+                    Key::Reg(1),
+                    Key::Reg(2),
+                    Key::Var("a".into()),
+                    Key::Var("b".into()),
+                    Key::Var("c".into()),
+                ];
+                for key in &keys {
+                    assert_eq!(
+                        index.overwritten_before_read(&stmts, start, key),
+                        overwritten_before_read(&stmts, start, key)
+                    );
+                }
+            }
         }
     }
 
