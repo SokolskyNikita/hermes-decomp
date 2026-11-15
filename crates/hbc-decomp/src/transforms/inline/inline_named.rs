@@ -275,6 +275,12 @@ fn inline_named_with_candidates(
             } else {
                 let mut stmt = stmt;
                 apply_pending_to_stmt(&mut stmt, &mut pending);
+                // A folded multi-use definition must reach this value too:
+                // `fn = o.fn; if (fn != null) { str = fn(1); }` dropped the
+                // definition but left `str = fn(1)` reading an unbound `fn`.
+                if !multi_use_defs.is_empty() {
+                    apply_multi_use_to_stmt(&mut stmt, &multi_use_defs);
+                }
                 result.push(stmt);
             }
         } else {
@@ -711,5 +717,49 @@ mod pending_order_tests {
         let rendered: Vec<String> = out.iter().map(|s| s.to_string()).collect();
         let calls = rendered.iter().filter(|s| s.contains("f()")).count();
         assert_eq!(calls, 1, "f() rendered once: {rendered:?}");
+    }
+
+    #[test]
+    fn a_multi_use_member_read_reaches_an_assignment_to_another_variable() {
+        // fn = o.fn; if (fn != null) { str = fn(1); } if (str == null) str = "no"; return str
+        // (`o?.fn?.(1)` after the Hermes `this` was stripped). The definition is
+        // folded into its uses; the call assigned to `str` must get it as well.
+        let member = Expression::member(var("o"), "fn");
+        let stmts = vec![
+            assign("fn", member.clone()),
+            Statement::If {
+                condition: Expression::binary(
+                    crate::ir::BinaryOp::Neq,
+                    var("fn"),
+                    Expression::constant(Constant::Null),
+                ),
+                then_body: vec![assign(
+                    "str",
+                    Expression::call(var("fn"), vec![Expression::constant(Constant::Integer(1))]),
+                )],
+                else_body: vec![],
+            },
+            Statement::If {
+                condition: Expression::binary(
+                    crate::ir::BinaryOp::Eq,
+                    var("str"),
+                    Expression::constant(Constant::Null),
+                ),
+                then_body: vec![assign(
+                    "str",
+                    Expression::constant(Constant::String("no".into())),
+                )],
+                else_body: vec![],
+            },
+            Statement::Return(Some(var("str"))),
+        ];
+        let out = inline_named_variables(stmts);
+        let text = crate::transforms::Codegen::new(Default::default()).generate_statements(&out);
+        let defined = out.iter().any(|s| matches!(s,
+            Statement::Assign { target: AssignTarget::Binding(Binding::Variable(n)), .. } if n == "fn"));
+        assert!(
+            defined || !text.contains("= fn(1)"),
+            "`fn` read with no definition: {text}"
+        );
     }
 }
