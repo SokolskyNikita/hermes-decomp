@@ -511,6 +511,22 @@ fn collect_function_refs(stmts: &[crate::ir::Statement], out: &mut Vec<u32>) {
             }
             self.walk_expression(e);
         }
+        // The shared walk skips class method values and bodies (other passes
+        // rely on that), but a class embeds each method's rendered text, so the
+        // owner depends on it. Without this edge an owner rendered in pass 1
+        // (an IIFE around a class, not a module factory) was never re-rendered
+        // and kept `/* body not rendered */` for every callback in its methods.
+        fn visit_statement(&mut self, s: &'b crate::ir::Statement) {
+            if let crate::ir::Statement::Class { methods, .. } = s {
+                for m in methods {
+                    self.visit_expression(&m.value);
+                    for st in m.body.iter().flatten() {
+                        self.visit_statement(st);
+                    }
+                }
+            }
+            self.walk_statement(s);
+        }
     }
     let mut c = C(out);
     for s in stmts {

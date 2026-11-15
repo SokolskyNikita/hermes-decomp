@@ -222,3 +222,79 @@ fn tracked_regression_fixtures_decompile() {
         failures.join("\n  ")
     );
 }
+
+// An ES5 class inside an IIFE (TypeScript or Babel loose output) is rendered
+// from the first inline pass. The fn-ref walk did not enter class methods, so
+// the class was never re-rendered once its methods' callbacks were filled in,
+// and every callback printed `/* body not rendered */`. Source in
+// class_methods.source.js (hermesc -O -g0, HBC 84). When node is available
+// the output must also print what the source prints.
+#[test]
+fn callbacks_in_class_methods_inside_an_iife_are_rendered() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let tmp = std::env::temp_dir().join(format!("hermes-e2e-clsm-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let out = tmp.join("class_methods_v84.js");
+    decompile(&dir.join("class_methods_v84.hbc"), &out).expect("decompile");
+    let js = std::fs::read_to_string(&out).expect("output");
+    assert!(
+        !js.contains("body not rendered"),
+        "hole left in a class method:\n{js}"
+    );
+    assert!(js.contains("+ \"!\""), "map callback missing:\n{js}");
+    assert!(
+        js.contains(".configure("),
+        "forEach callback missing:\n{js}"
+    );
+    if node_available() {
+        let want =
+            std::fs::read_to_string(dir.join("class_methods.expected.txt")).expect("expected");
+        let runner = tmp.join("class_methods_v84.run.js");
+        let got = run_under_node(&js, &runner);
+        assert!(
+            got.as_deref() == Ok(want.as_str()),
+            "printed {got:?}, expected {want:?}\n{js}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// Runs decompiled output under node with `print` shimmed to `console.log`,
+// calling the top-level `global` function the decompiler emits. A wrong
+// loop can make the output spin forever, so the run has a time limit.
+fn run_under_node(js: &str, runner: &Path) -> Result<String, String> {
+    let script = format!(
+        "globalThis.print = (...a) => console.log(a.join(\" \"));\n{js}\n\
+         if (typeof global === \"function\") global(globalThis);\n"
+    );
+    std::fs::write(runner, script).map_err(|e| format!("write runner: {e}"))?;
+    let mut child = Command::new("node")
+        .arg(runner)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn node: {e}"))?;
+    let start = Instant::now();
+    while child
+        .try_wait()
+        .map_err(|e| format!("wait: {e}"))?
+        .is_none()
+    {
+        if start.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("still running after 10 s".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().map_err(|e| format!("node: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let first = err
+            .lines()
+            .find(|l| l.contains("Error"))
+            .unwrap_or_default();
+        return Err(format!("exit {}: {first}", out.status));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
