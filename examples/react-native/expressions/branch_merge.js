@@ -1,0 +1,1 @@
+function merge(a, b) { var s = ""; if (a === b) s += "A"; else s += "a"; if (a < b) s += "B"; else s += "b"; if (a > b) s += "C"; else s += "c"; return s; } print(merge(1, 1), merge(1, 2), merge(2, 1));
