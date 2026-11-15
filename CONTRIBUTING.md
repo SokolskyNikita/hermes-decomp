@@ -24,6 +24,7 @@ duplicate work and lets us agree on an approach before code is written.
 
    ```bash
    bash scripts/build/fetch_hermesc.sh
+   bash scripts/build/fetch_hermesc_npm.sh   # HBC 98 and 99, from npm
    bash scripts/build/build_corpus.sh
    ```
 
