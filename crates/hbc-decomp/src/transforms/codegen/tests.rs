@@ -436,3 +436,25 @@ mod nested_write_import_tests {
         );
     }
 }
+
+#[test]
+fn chained_global_alias_binding_is_kept() {
+    use crate::ir::{PropertyKey, Value};
+    let global_json = Expression::Member {
+        object: Box::new(Expression::Value(Value::Global)),
+        property: PropertyKey::Ident("JSON".into()),
+        optional: false,
+    };
+    let value = Expression::Member {
+        object: Box::new(global_json),
+        property: PropertyKey::Ident("stringify".into()),
+        optional: false,
+    };
+    assert!(!Codegen::is_global_alias_def("stringify", &value));
+    let direct = Expression::Member {
+        object: Box::new(Expression::Value(Value::Global)),
+        property: PropertyKey::Ident("JSON".into()),
+        optional: false,
+    };
+    assert!(Codegen::is_global_alias_def("JSON", &direct));
+}
