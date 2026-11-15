@@ -206,3 +206,31 @@ pub fn builtins_for_version(version: u32) -> Vec<String> {
     json.and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opcode_of(format: &BytecodeFormat, name: &str) -> Option<u8> {
+        format
+            .definitions
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| d.opcode)
+    }
+
+    // The HBC 99 table is the one the released compiler (hermes-v260318099.0.x,
+    // npm `hermes-compiler`) emits. An earlier bytecode 99 snapshot still had
+    // the eight numeric JGreaterN jumps at 208..215, which pushed every later
+    // opcode up by eight and decoded `==` and `===` jumps as numeric ones.
+    #[test]
+    fn v99_table_matches_the_hermes_release() {
+        let v99 = BytecodeFormat::for_version(99).expect("v99 table");
+        assert_eq!(v99.definitions.len(), 220);
+        assert_eq!(opcode_of(&v99, "JEqual"), Some(208));
+        assert_eq!(opcode_of(&v99, "JStrictEqual"), Some(212));
+        assert_eq!(opcode_of(&v99, "JStrictNotEqualLong"), Some(215));
+        assert_eq!(opcode_of(&v99, "JGreaterN"), None);
+        assert_eq!(opcode_of(&v99, "JNotGreaterEqualNLong"), None);
+    }
+}
