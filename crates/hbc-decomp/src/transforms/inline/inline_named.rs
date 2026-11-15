@@ -299,10 +299,15 @@ fn inline_named_with_candidates(
         // variable (`delete cfg[str6]` inside a generator's `while (true)`).
         // A constant never changes, so substituting it per iteration is sound.
         if is_loop(stmt) {
+            // A name the loop itself assigns (a for-in/for-of binding, or a write in the
+            // body) is not constant across iterations: `key = undefined; for (key in o)`.
+            let reassigned = assigned_variable_names(stmt);
             let consts: BTreeMap<String, Expression> = multi_use_defs
                 .iter()
                 .filter(|(name, value)| {
-                    is_constant_expr(value) && def_pos.get(*name).is_none_or(|p| *p <= i)
+                    is_constant_expr(value)
+                        && def_pos.get(*name).is_none_or(|p| *p <= i)
+                        && !reassigned.contains(name)
                 })
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect();
