@@ -281,7 +281,9 @@ fn try_load(path: &Path, want: &CacheHeader) -> Option<PipelineContext> {
 fn try_save(path: &Path, header: &CacheHeader, ctx: &PipelineContext) -> std::io::Result<()> {
     // Write to a temp file then rename, so a concurrent reader never sees a
     // half-written cache.
-    let tmp = path.with_extension("hdcache.tmp");
+    // The temp name is unique per process: with a shared cache directory, two runs
+    // may save the same entry at once, and must not write into one temp file.
+    let tmp = path.with_extension(format!("hdcache.{}.tmp", std::process::id()));
     {
         let f = std::fs::File::create(&tmp)?;
         let mut writer = BufWriter::new(f);

@@ -140,6 +140,11 @@ fn emit_build_fingerprint(manifest_dir: &Path) {
     );
 
     let mut files = Vec::new();
+    // The workspace lock file: the same sources built against other dependency
+    // versions are a different build too.
+    let lock = manifest_dir.join("../../Cargo.lock");
+    println!("cargo:rerun-if-changed={}", lock.display());
+    files.push(lock);
     collect_files(&src_dir, "rs", &mut files);
     collect_files(&manifest_dir.join("resources"), "json", &mut files);
     files.sort();
