@@ -193,14 +193,21 @@ pub fn propagate_copies(cfg: &mut CFG) {
 
     // Pass 1, record each copy's source-register reaching set at the copy point.
     let mut signatures: HashMap<u32, HashSet<DefSite>> = HashMap::new();
+    // Copy targets by the position of their copy statement, so each statement
+    // looks up its own copies instead of scanning all of them.
+    let mut site_copies: HashMap<(BlockId, usize), Vec<u32>> = HashMap::new();
+    for (a, site) in &copy_sites {
+        site_copies
+            .entry((site.block, site.stmt_index))
+            .or_default()
+            .push(*a);
+    }
     for block in cfg.blocks() {
         let mut cur = per_reg_reaching(block.id);
         for (i, stmt) in block.statements.iter().enumerate() {
-            for (a, b) in &copies {
-                if copy_sites
-                    .get(a)
-                    .is_some_and(|s| s.block == block.id && s.stmt_index == i)
-                {
+            if let Some(targets) = site_copies.get(&(block.id, i)) {
+                for a in targets {
+                    let b = &copies[a];
                     signatures.insert(*a, cur.get(b).cloned().unwrap_or_default());
                 }
             }
@@ -223,20 +230,28 @@ pub fn propagate_copies(cfg: &mut CFG) {
     // The active substitution map (`a` -> `b`) at the current program point:
     // a copy applies only where its source's reaching set still matches the
     // signature recorded at the copy.
+    let applies = |a: u32, b: u32, cur: &HashMap<u32, HashSet<DefSite>>| -> bool {
+        match (signatures.get(&a), cur.get(&b)) {
+            (Some(sig), Some(now)) => now == sig,
+            (Some(sig), None) => sig.is_empty(),
+            (None, _) => false,
+        }
+    };
+    let copy_expr = |b: u32| Expression::Value(Value::Binding(Binding::Register(b)));
     let active_map = |cur: &HashMap<u32, HashSet<DefSite>>| -> BTreeMap<u32, Expression> {
         copies
             .iter()
-            .filter_map(|(a, b)| {
-                let sig = signatures.get(a)?;
-                let now = cur.get(b).cloned().unwrap_or_default();
-                if &now == sig {
-                    Some((*a, Expression::Value(Value::Binding(Binding::Register(*b)))))
-                } else {
-                    None
-                }
-            })
+            .filter(|(a, b)| applies(**a, **b, cur))
+            .map(|(a, b)| (*a, copy_expr(*b)))
             .collect()
     };
+    // Copy targets by source register: a write to `b` can only change whether
+    // the copies reading `b` apply, so the map is updated for those alone
+    // instead of being rebuilt from every copy at every statement.
+    let mut by_source: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (a, b) in &copies {
+        by_source.entry(*b).or_default().push(*a);
+    }
 
     // Pass 2, substitute uses.
     for block_id in cfg.block_ids().collect::<Vec<_>>() {
@@ -246,8 +261,8 @@ pub fn propagate_copies(cfg: &mut CFG) {
             None => continue,
         };
         let mut new_stmts = Vec::with_capacity(stmts.len());
+        let mut active = active_map(&cur);
         for (i, stmt) in stmts.into_iter().enumerate() {
-            let active = active_map(&cur);
             let new_stmt = if active.is_empty() {
                 stmt
             } else {
@@ -265,10 +280,18 @@ pub fn propagate_copies(cfg: &mut CFG) {
                     register: *r,
                 });
                 cur.insert(*r, set);
+                if let Some(targets) = by_source.get(r) {
+                    for &a in targets {
+                        if applies(a, *r, &cur) {
+                            active.insert(a, copy_expr(*r));
+                        } else {
+                            active.remove(&a);
+                        }
+                    }
+                }
             }
             new_stmts.push(new_stmt);
         }
-        let active = active_map(&cur);
         if let Some(block) = cfg.get_mut(block_id) {
             block.statements = new_stmts;
             if !active.is_empty() {
