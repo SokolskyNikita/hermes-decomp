@@ -522,6 +522,53 @@ fn rename_variables_in_expr(expr: &mut Expression, renames: &BTreeMap<String, St
             rename_variables_in_target(target, renames);
             rename_variables_in_expr(value, renames);
         }
+        // The same reads `rename_expr` reaches: a binding read inside `${...}`,
+        // a spread, an await or a yield is renamed with every other read.
+        Expression::TemplateLiteral { expressions, .. } => {
+            for e in expressions {
+                rename_variables_in_expr(e, renames);
+            }
+        }
+        Expression::Spread(inner) | Expression::Await(inner) => {
+            rename_variables_in_expr(inner, renames)
+        }
+        Expression::Yield { value, .. } => rename_variables_in_expr(value, renames),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rename_variables_in_stmts;
+    use crate::ir::{Binding, Expression, Statement, Value};
+    use std::collections::BTreeMap;
+
+    fn var(n: &str) -> Expression {
+        Expression::Value(Value::Binding(Binding::Variable(n.into())))
+    }
+
+    #[test]
+    fn a_read_inside_a_template_literal_or_spread_is_renamed() {
+        // The import binding `_module` became `clamp`, but the read inside
+        // `${_module.isMissing(null)},` kept the old name: a ReferenceError.
+        let renames = BTreeMap::from([("_module".to_string(), "clamp".to_string())]);
+        let mut stmts = vec![
+            Statement::Expr(Expression::TemplateLiteral {
+                quasis: vec![String::new(), ",".into()],
+                expressions: vec![var("_module")],
+            }),
+            Statement::Expr(Expression::Spread(Box::new(var("_module")))),
+        ];
+        rename_variables_in_stmts(&mut stmts, &renames);
+        assert_eq!(
+            stmts,
+            vec![
+                Statement::Expr(Expression::TemplateLiteral {
+                    quasis: vec![String::new(), ",".into()],
+                    expressions: vec![var("clamp")],
+                }),
+                Statement::Expr(Expression::Spread(Box::new(var("clamp")))),
+            ]
+        );
     }
 }
