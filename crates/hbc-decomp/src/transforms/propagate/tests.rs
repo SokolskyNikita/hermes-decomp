@@ -175,3 +175,60 @@ fn test_param_copy_chain_resolves_across_blocks() {
         "a param copy chain must resolve to the parameter in a later block"
     );
 }
+
+// The active copies are updated as the block is walked. A copy that applies
+// right after it is made must stop applying, in the same block, at the
+// statement that overwrites its source.
+#[test]
+fn test_copy_stops_applying_where_its_source_is_overwritten_in_the_block() {
+    // b0:  r5 = 0
+    //      r0 = r5          ; copy
+    //      r6 = r0 + 1      ; -> r5 + 1
+    //      r5 = 99          ; source overwritten
+    //      r7 = r0 + r6     ; r0 must stay (r0 == 0, r5 == 99)
+    //      return r7
+    let add = |l: Expression, r: Expression| Expression::binary(crate::ir::BinaryOp::Add, l, r);
+    let mut builder = CFGBuilder::new();
+    builder.emit(Statement::assign_reg(
+        5,
+        Expression::constant(Constant::Integer(0)),
+    ));
+    builder.emit(Statement::assign_reg(0, Expression::register(5)));
+    builder.emit(Statement::assign_reg(
+        6,
+        add(
+            Expression::register(0),
+            Expression::constant(Constant::Integer(1)),
+        ),
+    ));
+    builder.emit(Statement::assign_reg(
+        5,
+        Expression::constant(Constant::Integer(99)),
+    ));
+    builder.emit(Statement::assign_reg(
+        7,
+        add(Expression::register(0), Expression::register(6)),
+    ));
+    builder.emit_return(Some(Expression::register(7)));
+
+    let mut cfg = builder.finish();
+    propagate_copies(&mut cfg);
+
+    let left_of = |i: usize| match &cfg.entry_block().statements[i] {
+        Statement::Assign {
+            value: Expression::Binary { left, .. },
+            ..
+        } => (**left).clone(),
+        other => panic!("expected binary assignment, got {other:?}"),
+    };
+    assert_eq!(
+        left_of(2),
+        Expression::register(5),
+        "copy applies before the overwrite"
+    );
+    assert_eq!(
+        left_of(4),
+        Expression::register(0),
+        "copy must not apply after the overwrite"
+    );
+}
