@@ -114,8 +114,13 @@ pub fn parse_function_headers(
                 let non_ptr_reg_count = ((raw >> 59) & ((1u128 << 5) - 1)) as u32;
                 let frame_size = ((raw >> 64) & 0xff) as u32;
                 let read_cache_size = ((raw >> 72) & 0xff) as u8;
-                let write_cache_size = ((raw >> 80) & 0x3f) as u8;
-                let num_cache_new_object = ((raw >> 86) & 0x1) as u8;
+                // tooling-eval local patch: v99 has WriteCacheSize:7 (bits 80-86) and
+                // no NumCacheNewObject bit; v97/98 use 6 + 1.
+                let (write_cache_size, num_cache_new_object) = if header.version >= 99 {
+                    (((raw >> 80) & 0x7f) as u8, 0u8)
+                } else {
+                    (((raw >> 80) & 0x3f) as u8, ((raw >> 86) & 0x1) as u8)
+                };
                 let private_name_cache_size = ((raw >> 87) & 0x1) as u8;
                 let flags = ((raw >> 88) & 0xff) as u8;
 
@@ -123,7 +128,7 @@ pub fn parse_function_headers(
                     let large_offset = ((function_name as u64) << MODERN_LARGE_OFFSET_SHIFT)
                         | (offset as u64 & MODERN_LARGE_OFFSET_MASK);
                     let large_header =
-                        parse_large_header_modern(reader, large_offset as usize, function_id)?;
+                        parse_large_header_modern(reader, large_offset as usize, function_id, header.version)?;
                     reader.seek(current_pos + 12)?;
                     FunctionHeader::Modern(large_header)
                 } else {
@@ -182,6 +187,7 @@ fn parse_large_header_modern(
     reader: &mut ByteReader<'_>,
     offset: usize,
     function_id: u32,
+    version: u32,
 ) -> Result<ModernFunctionHeader> {
     let current = reader.position();
     reader.seek(offset)?;
@@ -198,7 +204,11 @@ fn parse_large_header_modern(
         frame_size: reader.read_u32()?,
         read_cache_size: reader.read_u8()?,
         write_cache_size: reader.read_u8()?,
-        num_cache_new_object: reader.read_u8()?,
+        // tooling-eval local patch: HBC v99 dropped NumCacheNewObject from the
+        // large FunctionHeader (8 x u32 + ReadCache, WriteCache, PrivateNameCache,
+        // flags = 36 bytes; see hermes-v260318099.0.4 BytecodeFileFormat.h).
+        // Reading the v97/98 byte here shifted flags and the info section by 1.
+        num_cache_new_object: if version >= 99 { 0 } else { reader.read_u8()? },
         private_name_cache_size: reader.read_u8()?,
         flags: reader.read_u8()?,
         info_offset: 0,

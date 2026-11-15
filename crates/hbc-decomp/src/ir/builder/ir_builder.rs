@@ -136,6 +136,15 @@ impl<'a> IRBuilder<'a> {
             if is_iterator_cleanup_handler(instructions, self.format, handler.target) {
                 continue;
             }
+            // tooling-eval local patch: some HBC v99 functions yield start > end,
+            // which panics BTreeMap::range. Skip and log instead of aborting.
+            if handler.start > handler.end {
+                eprintln!(
+                    "tooling-eval: skipping exception handler start={} end={} target={}",
+                    handler.start, handler.end, handler.target
+                );
+                continue;
+            }
             if let (Some(&try_start), Some(&catch_block)) = (
                 offset_to_block.get(&handler.start),
                 offset_to_block.get(&handler.target),

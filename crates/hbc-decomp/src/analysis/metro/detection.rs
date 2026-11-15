@@ -161,7 +161,10 @@ impl MetroDetector {
 
             // Metro format: __d(undefined, factory, moduleId, deps)
             // Arguments: [0] = undefined/context, [1] = function, [2] = moduleId, [3] = deps
-            if arguments.len() == 4 {
+            // tooling-eval local patch: Metro emits __d(factory, id) with no deps
+            // array for dependency-free modules (Call3: this, factory, id). Those
+            // were skipped (802 of 4,738 modules in a production RN bundle, incl. React core).
+            if arguments.len() == 4 || arguments.len() == 3 {
                 // Get function ID - either directly or via register/variable lookup
                 let function_id = match &arguments[1] {
                     Expression::Function { id, .. } => Some(id.0),
@@ -192,9 +195,11 @@ impl MetroDetector {
                 };
 
                 // Get dependencies - either directly or via register/variable lookup
-                let dependencies = match &arguments[3] {
+                let no_deps = Expression::Array { elements: Vec::new() };
+                let deps_expr = arguments.get(3).unwrap_or(&no_deps);
+                let dependencies = match deps_expr {
                     Expression::Array { .. } => {
-                        extract_array_of_integers(&arguments[3], Some(reg_integers))
+                        extract_array_of_integers(deps_expr, Some(reg_integers))
                             .unwrap_or_default()
                     }
                     Expression::Value(Value::Binding(Binding::Register(r))) => reg_arrays

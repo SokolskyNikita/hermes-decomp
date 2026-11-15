@@ -36,7 +36,7 @@ pub fn read_buffer_series(
     let mut values = Vec::with_capacity(reader.capacity_hint(count as usize));
 
     while values.len() < count as usize {
-        let (tag, length) = read_buffer_tag(&mut reader)?;
+        let (tag, length) = read_buffer_tag(&mut reader, file.header.version)?;
         // Hermes never emits length-0 sequences, but a corrupt/misaligned stream
         // can produce them. Skip empty tags rather than aborting the whole series
         // so a single bad tag doesn't wipe the rest of a large literal.
@@ -55,7 +55,7 @@ pub fn read_buffer_series(
     Ok(values)
 }
 
-fn read_buffer_tag(reader: &mut ByteReader<'_>) -> Result<(DataBufferTag, u32)> {
+fn read_buffer_tag(reader: &mut ByteReader<'_>, version: u32) -> Result<(DataBufferTag, u32)> {
     let key_tag = reader.read_u8()?;
     let tag_bits = key_tag & 0x70;
     let length = if (key_tag & 0x80) != 0 {
@@ -72,6 +72,10 @@ fn read_buffer_tag(reader: &mut ByteReader<'_>) -> Result<(DataBufferTag, u32)> 
         0x30 => DataBufferTag::Number,
         0x40 => DataBufferTag::LongString,
         0x50 => DataBufferTag::ShortString,
+        // tooling-eval local patch: Hermes replaced ByteStringTag with UndefinedTag
+        // (6 << 4) in static_h 00c0f0b350 (Mar 2025, still "v98"); every v99 file
+        // uses Undefined. Late-v98 files are ambiguous and keep the old reading.
+        0x60 if version >= 99 => DataBufferTag::Undefined,
         0x60 => DataBufferTag::ByteString,
         0x70 => DataBufferTag::Integer,
         _ => DataBufferTag::Undefined,
