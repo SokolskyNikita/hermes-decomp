@@ -12,7 +12,13 @@ pub(crate) struct RecoveryCtx<'a> {
     pub cfg: &'a crate::ir::CFG,
     pub loops: &'a [LoopInfo],
     pub visited: &'a mut HashSet<BlockId>,
-    pub try_starts: &'a BTreeMap<BlockId, &'a CfgExceptionHandler>,
+    // Handlers whose protected range starts at a block, outermost first. Several
+    // can share a start: `try { } catch { } finally { }` compiles to a catch
+    // handler and a catch-all (finally) handler over the same first block.
+    pub try_starts: &'a BTreeMap<BlockId, Vec<&'a CfgExceptionHandler>>,
+    // A loop header whose block walk must not start the loop again: set while
+    // the body of a loop whose header opens a `try` is recovered.
+    pub plain_header: Option<BlockId>,
 }
 
 #[derive(Debug, Clone)]

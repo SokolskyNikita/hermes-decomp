@@ -46,7 +46,7 @@ pub fn detect_loops(cfg: &CFG) -> Vec<LoopInfo> {
         body.insert(header);
 
         for (from, _) in &edges {
-            collect_loop_body(cfg, *from, header, &mut body);
+            collect_loop_body(cfg, &dominators, *from, header, &mut body);
         }
 
         // Find loop exit (successor of header not in body, or branch target out of body)
@@ -73,19 +73,40 @@ pub fn detect_loops(cfg: &CFG) -> Vec<LoopInfo> {
     loops
 }
 
-fn collect_loop_body(cfg: &CFG, node: BlockId, header: BlockId, body: &mut BTreeSet<BlockId>) {
+fn collect_loop_body(
+    cfg: &CFG,
+    dominators: &BTreeMap<BlockId, HashSet<BlockId>>,
+    node: BlockId,
+    header: BlockId,
+    body: &mut BTreeSet<BlockId>,
+) {
     if body.contains(&node) {
         return;
     }
     body.insert(node);
     for pred in cfg.predecessors(node) {
         if pred != header {
-            collect_loop_body(cfg, pred, header, body);
+            collect_loop_body(cfg, dominators, pred, header, body);
+        }
+    }
+    // A catch block in the loop is entered from its protected blocks. They are
+    // part of the loop too (a `throw` inside the try has no normal successor,
+    // so the walk above never reaches it), as long as the header dominates
+    // them: a try that encloses the whole loop stays outside.
+    for pred in cfg.exception_edge_sources(node) {
+        let in_loop = dominators
+            .get(&pred)
+            .is_some_and(|d| d.contains(&header));
+        if pred != header && in_loop {
+            collect_loop_body(cfg, dominators, pred, header, body);
         }
     }
 }
 
 fn find_loop_exit(cfg: &CFG, header: BlockId, body: &BTreeSet<BlockId>) -> Option<BlockId> {
+    if let Some(exit) = common_loop_exit(cfg, body) {
+        return Some(exit);
+    }
     if let Some(block) = cfg.get(header) {
         for succ in block.successors() {
             if !body.contains(&succ) {
@@ -107,6 +128,48 @@ fn find_loop_exit(cfg: &CFG, header: BlockId, body: &BTreeSet<BlockId>) -> Optio
     None
 }
 
+// When the loop leaves through several blocks and all of them flow into one
+// of them, that one is the real exit. This is the shape of a `break` out of a
+// `try` with a `finally`: Hermes copies the finally body onto the break path,
+// so the break goes to that copy and the copy falls into the block after the
+// loop. Picking the copy as the exit (the first exit in block order) left the
+// loop's own condition with nowhere to break to, and it was dropped.
+fn common_loop_exit(cfg: &CFG, body: &BTreeSet<BlockId>) -> Option<BlockId> {
+    let mut exits: Vec<BlockId> = Vec::new();
+    for &b in body {
+        if let Some(block) = cfg.get(b) {
+            for succ in block.successors() {
+                if !body.contains(&succ) && !exits.contains(&succ) {
+                    exits.push(succ);
+                }
+            }
+        }
+    }
+    if exits.len() < 2 {
+        return None;
+    }
+    let reaches = |from: BlockId, to: BlockId| -> bool {
+        let mut seen: HashSet<BlockId> = HashSet::new();
+        let mut stack = vec![from];
+        while let Some(n) = stack.pop() {
+            if n == to {
+                return true;
+            }
+            if body.contains(&n) || !seen.insert(n) {
+                continue;
+            }
+            if let Some(block) = cfg.get(n) {
+                stack.extend(block.successors());
+            }
+        }
+        false
+    };
+    exits
+        .iter()
+        .copied()
+        .find(|&e| exits.iter().all(|&o| o == e || reaches(o, e)))
+}
+
 pub fn compute_dominators(cfg: &CFG) -> BTreeMap<BlockId, HashSet<BlockId>> {
     let all_blocks: HashSet<_> = cfg.block_ids().collect();
     let mut dom: BTreeMap<BlockId, HashSet<BlockId>> = BTreeMap::new();
@@ -118,8 +181,30 @@ pub fn compute_dominators(cfg: &CFG) -> BTreeMap<BlockId, HashSet<BlockId>> {
     // own outgoing edge (e.g. `catch -> return`) look like a back edge and
     // spuriously flags the target as a loop header, that dropped the `return`
     // out of `catch (e) { return e.message; }`.
+    //
+    // A catch block is not a root of its own, though: it is reached from every
+    // block of its protected range. Making it a root cut the try blocks out of
+    // the dominator sets of everything after the catch, so a loop whose body
+    // has a try/catch (`for (..) { try { .. } catch { continue; } }`) lost its
+    // back edge and was not recognised as a loop at all. Feed each catch block
+    // from its protected blocks instead, and fall back to a root only when the
+    // range is empty.
+    let mut exception_preds: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
+    for h in &cfg.exception_handlers {
+        let preds = exception_preds.entry(h.catch_block).or_default();
+        for &b in &h.try_blocks {
+            if b != h.catch_block && !preds.contains(&b) {
+                preds.push(b);
+            }
+        }
+    }
     let roots: HashSet<BlockId> = std::iter::once(cfg.entry)
-        .chain(cfg.exception_handlers.iter().map(|h| h.catch_block))
+        .chain(
+            exception_preds
+                .iter()
+                .filter(|(_, p)| p.is_empty())
+                .map(|(c, _)| *c),
+        )
         .collect();
 
     for id in cfg.block_ids() {
@@ -143,7 +228,14 @@ pub fn compute_dominators(cfg: &CFG) -> BTreeMap<BlockId, HashSet<BlockId>> {
                 continue;
             }
 
-            let preds = cfg.predecessors(block_id);
+            let mut preds = cfg.predecessors(block_id);
+            if let Some(extra) = exception_preds.get(&block_id) {
+                for &p in extra {
+                    if !preds.contains(&p) {
+                        preds.push(p);
+                    }
+                }
+            }
             if preds.is_empty() {
                 continue;
             }
