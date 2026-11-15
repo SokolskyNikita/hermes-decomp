@@ -135,10 +135,19 @@ pub fn inline_named_variables_keeping(
         .map(|(name, _)| name.clone())
         .collect();
 
+    // Multi-use definitions are folded into their uses, but the substitution
+    // does not reach into loop bodies, so a folded `t = o.traits.err` read in
+    // a loop body left `t` undeclared. A non-constant value can also change
+    // between iterations, so such a definition stays a variable.
+    let read_in_loop = nonconstant_defs_read_in_loops(&stmts);
     let multi_use_candidates: std::collections::HashSet<String> = def_count
         .iter()
         .filter(|(name, &defs)| {
-            if defs != 1 || !is_inlinable_name(name) || keep.contains(*name) {
+            if defs != 1
+                || !is_inlinable_name(name)
+                || keep.contains(*name)
+                || read_in_loop.contains(*name)
+            {
                 return false;
             }
             let uses = use_count.get(*name).copied().unwrap_or(0);
@@ -478,6 +487,66 @@ fn assigned_variable_names(stmt: &Statement) -> Vec<String> {
     let mut c = C(Vec::new());
     c.visit_statement(stmt);
     c.0
+}
+
+// Names read anywhere inside a loop (condition, header or body, at any depth)
+// whose definition somewhere in `stmts` is not a plain constant.
+fn nonconstant_defs_read_in_loops(stmts: &[Statement]) -> std::collections::HashSet<String> {
+    use crate::ir::Visitor;
+    use std::collections::HashSet;
+    #[derive(Default)]
+    struct C {
+        loop_depth: usize,
+        read_in_loop: HashSet<String>,
+        nonconstant: HashSet<String>,
+    }
+    impl<'a> Visitor<'a> for C {
+        fn visit_statement(&mut self, stmt: &'a Statement) {
+            match stmt {
+                Statement::Assign {
+                    target: AssignTarget::Binding(Binding::Variable(name)),
+                    value,
+                }
+                | Statement::Let { name, value, .. } => {
+                    if !is_constant_expr(value) {
+                        self.nonconstant.insert(name.clone());
+                    }
+                }
+                _ => {}
+            }
+            let is_loop = is_loop(stmt);
+            self.loop_depth += usize::from(is_loop);
+            self.walk_statement(stmt);
+            self.loop_depth -= usize::from(is_loop);
+        }
+        fn visit_expression(&mut self, e: &'a Expression) {
+            if self.loop_depth > 0 {
+                if let Expression::Value(Value::Binding(Binding::Variable(n))) = e {
+                    self.read_in_loop.insert(n.clone());
+                }
+            }
+            self.walk_expression(e);
+        }
+    }
+    let mut c = C::default();
+    for s in stmts {
+        c.visit_statement(s);
+    }
+    c.read_in_loop
+        .intersection(&c.nonconstant)
+        .cloned()
+        .collect()
+}
+
+fn is_loop(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::While { .. }
+            | Statement::DoWhile { .. }
+            | Statement::For { .. }
+            | Statement::ForIn { .. }
+            | Statement::ForOf { .. }
+    )
 }
 
 fn expr_reads_variable(expr: &Expression, name: &str) -> bool {

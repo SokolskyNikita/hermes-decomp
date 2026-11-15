@@ -222,3 +222,73 @@ fn tracked_regression_fixtures_decompile() {
         failures.join("\n  ")
     );
 }
+
+// A value defined once and read several times, once inside a loop, was folded
+// into its uses and its definition dropped, but the substitution does not
+// reach into loop bodies, so the loop read a name nothing declared
+// (`ReferenceError: err is not defined`). Source in loop_use.source.js,
+// compiled with hermesc -O -g0 (HBC 98 from npm hermes-compiler@250829098.0.16, HBC 84 from Hermes v0.9.0); the output must print what
+// the source prints. Skipped without node.
+#[test]
+fn a_value_read_in_a_loop_keeps_its_definition() {
+    if !node_available() {
+        eprintln!("skipped: node not available");
+        return;
+    }
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let want = std::fs::read_to_string(dir.join("loop_use.expected.txt")).expect("expected");
+    let tmp = std::env::temp_dir().join(format!("hermes-e2e-loopuse-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    for v in ["v98", "v84"] {
+        let out = tmp.join(format!("loop_use_{v}.js"));
+        decompile(&dir.join(format!("loop_use_{v}.hbc")), &out).expect("decompile");
+        let js = std::fs::read_to_string(&out).expect("output");
+        let runner = tmp.join(format!("loop_use_{v}.run.js"));
+        let got = run_under_node(&js, &runner);
+        assert!(
+            got.as_deref() == Ok(want.as_str()),
+            "{v}: printed {got:?}, expected {want:?}\n{js}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// Runs decompiled output under node with `print` shimmed to `console.log`,
+// calling the top-level `global` function the decompiler emits. A wrong
+// loop can make the output spin forever, so the run has a time limit.
+fn run_under_node(js: &str, runner: &Path) -> Result<String, String> {
+    let script = format!(
+        "globalThis.print = (...a) => console.log(a.join(\" \"));\n{js}\n\
+         if (typeof global === \"function\") global(globalThis);\n"
+    );
+    std::fs::write(runner, script).map_err(|e| format!("write runner: {e}"))?;
+    let mut child = Command::new("node")
+        .arg(runner)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn node: {e}"))?;
+    let start = Instant::now();
+    while child
+        .try_wait()
+        .map_err(|e| format!("wait: {e}"))?
+        .is_none()
+    {
+        if start.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("still running after 10 s".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().map_err(|e| format!("node: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let first = err
+            .lines()
+            .find(|l| l.contains("Error"))
+            .unwrap_or_default();
+        return Err(format!("exit {}: {first}", out.status));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
