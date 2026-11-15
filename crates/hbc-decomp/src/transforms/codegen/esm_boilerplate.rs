@@ -292,18 +292,9 @@ impl Codegen {
             }
         }
 
-        // Pattern 1b: const prototype = globalThis.X.prototype (chained member on built-in)
-        // Also handles: const valueOf = globalThis.Boolean.prototype.valueOf
-        if let Expression::Member {
-            object,
-            property: PropertyKey::Ident(prop),
-            ..
-        } = value
-        {
-            if Self::is_global_builtin_chain(object) && name == prop.as_str() {
-                return true;
-            }
-        }
+        // A chained alias (`const stringify = globalThis.JSON.stringify`) is NOT
+        // redundant: a bare `stringify` is not a global, so dropping the binding
+        // left `stringify.call(...)` pointing at nothing and lost the receiver.
 
         // Pattern 2: const X = globalThis (direct Global value). Only redundant
         // when X is a conventional global alias (window/self/global/globalThis),         // those are interchangeable with `globalThis`. For any other name, dropping
@@ -327,35 +318,5 @@ impl Codegen {
         }
 
         false
-    }
-
-    // Check if an expression is a chain of member accesses starting from a global built-in.
-    // e.g., globalThis.Object, globalThis.Boolean.prototype, globalThis.ReferenceError.prototype
-    pub(super) fn is_global_builtin_chain(expr: &crate::ir::Expression) -> bool {
-        use crate::ir::{Expression, PropertyKey, Value};
-        match expr {
-            // Base case: globalThis.BuiltIn
-            Expression::Member {
-                object,
-                property: PropertyKey::Ident(name),
-                ..
-            } => {
-                let is_global = match object.as_ref() {
-                    Expression::Value(Value::Global) => true,
-                    Expression::Value(Value::Binding(crate::ir::Binding::Variable(v)))
-                        if v == "globalThis" =>
-                    {
-                        true
-                    }
-                    _ => false,
-                };
-                if is_global && crate::ir::expr::display::is_builtin_global(name) {
-                    return true;
-                }
-                // Recursive case: (some chain).property
-                Self::is_global_builtin_chain(object)
-            }
-            _ => false,
-        }
     }
 }
