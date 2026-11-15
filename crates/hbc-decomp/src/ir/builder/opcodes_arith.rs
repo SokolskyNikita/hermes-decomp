@@ -79,16 +79,16 @@ pub fn handle_inc_dec(name: &str, inst: &Instruction) -> Option<Statement> {
     let dst = get_reg(&inst.operands, 0)?;
     let src = reg_expr(&inst.operands, 1)?;
 
-    let one = Expression::constant(crate::ir::Constant::Integer(1));
+    // `++`/`--`, not `+ 1`: the operand may be a BigInt or a string.
     let op = if name.contains("Inc") {
-        BinaryOp::Add
+        UnaryOp::Inc
     } else {
-        BinaryOp::Sub
+        UnaryOp::Dec
     };
 
     Some(Statement::Assign {
         target: AssignTarget::Binding(Binding::Register(dst)),
-        value: Expression::binary(op, src, one),
+        value: Expression::unary(op, src),
     })
 }
 

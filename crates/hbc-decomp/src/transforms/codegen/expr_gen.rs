@@ -73,6 +73,16 @@ impl Codegen {
                         return format!("{op}({})", self.generate_expr(operand));
                     }
                 }
+                // `++x` needs a variable or property; anything else keeps the numeric form.
+                if matches!(op, crate::ir::UnaryOp::Inc | crate::ir::UnaryOp::Dec)
+                    && !matches!(
+                        operand.as_ref(),
+                        Expression::Value(Value::Binding(_)) | Expression::Member { .. }
+                    )
+                {
+                    let sign = if matches!(op, crate::ir::UnaryOp::Inc) { '+' } else { '-' };
+                    return format!("({} {sign} 1)", self.generate_expr(operand));
+                }
                 // `void 0` is the compiler's spelling of `undefined`.
                 if matches!(op, crate::ir::UnaryOp::Void) {
                     if matches!(

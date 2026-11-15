@@ -458,3 +458,16 @@ fn chained_global_alias_binding_is_kept() {
     };
     assert!(Codegen::is_global_alias_def("JSON", &direct));
 }
+
+#[test]
+fn test_inc_dec_print_as_update_not_plus_one() {
+    // `x + 1` throws on a BigInt, so Inc/Dec must print as `++`/`--`.
+    use crate::ir::{Binding, UnaryOp, Value};
+    let reg = || Expression::Value(Value::Binding(Binding::Register(0)));
+    let mut codegen = Codegen::new(CodegenOptions::new());
+    let inc = Statement::let_stmt("a", Expression::unary(UnaryOp::Inc, reg()));
+    let dec = Statement::let_stmt("b", Expression::unary(UnaryOp::Dec, reg()));
+    let out = codegen.generate_statements(&[inc, dec]);
+    assert!(out.contains("let a = ++r0;"), "{out}");
+    assert!(out.contains("let b = --r0;"), "{out}");
+}
