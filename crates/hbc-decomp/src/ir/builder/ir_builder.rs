@@ -136,6 +136,17 @@ impl<'a> IRBuilder<'a> {
             if is_iterator_cleanup_handler(instructions, self.format, handler.target) {
                 continue;
             }
+            // Hermes never emits an inverted range, but a misread handler table
+            // can, and BTreeMap::range panics on one. Drop the handler instead
+            // of the whole decompile.
+            if handler.start > handler.end {
+                log::warn!(
+                    "skipping exception handler with start {} after end {}",
+                    handler.start,
+                    handler.end
+                );
+                continue;
+            }
             if let (Some(&try_start), Some(&catch_block)) = (
                 offset_to_block.get(&handler.start),
                 offset_to_block.get(&handler.target),
