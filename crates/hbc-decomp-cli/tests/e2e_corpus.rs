@@ -288,6 +288,27 @@ fn a_value_read_deep_in_a_branch_keeps_its_definition() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+// A constant used once, as the key of a `delete` inside a generator's
+// `while (true)` state loop, lost its definition and kept its name:
+// `delete cfg[str2]` with no `str2` anywhere (a production RN bundle CborCodec dropped
+// `"body"` this way). Source in delete_const_key.source.js (hermesc -O -g0, v99).
+#[test]
+fn a_constant_key_used_inside_a_loop_is_substituted() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let tmp = std::env::temp_dir().join(format!("hermes-e2e-delkey-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let out = tmp.join("delete_const_key.js");
+    decompile(&dir.join("delete_const_key_v99.hbc"), &out).expect("decompile");
+    let js = std::fs::read_to_string(&out).expect("output");
+
+    assert!(
+        js.contains(r#"["body"]"#) && js.contains(r#"["content-type"]"#),
+        "the deleted keys must be the literals:\n{js}"
+    );
+    assert!(!js.contains("[str"), "no undeclared strN key may remain:\n{js}");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 fn is_plain_ident(s: &str) -> bool {
     let mut chars = s.chars();
     chars

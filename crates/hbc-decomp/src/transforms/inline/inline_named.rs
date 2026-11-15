@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use super::cleanup::cleanup_noise;
 use super::counting::{
     apply_pending_to_stmt, count_var_defs_uses, flush_pending, remove_used_from_pending,
-    substitute_vars_in_expr,
+    substitute_vars_in_expr, substitute_vars_in_stmt,
 };
 
 // Inline named variables (tmp*, closure_*, etc.) that are assigned once and used once,
@@ -293,6 +293,24 @@ fn inline_named_with_candidates(
     // Phase 3: Recurse into sub-blocks to apply inlining there too, reusing the
     // whole-function candidate sets and the definitions folded before the block.
     for (i, stmt) in result.iter_mut().enumerate() {
+        // A loop body is not recursed into (see `recurse_inline_blocks`), but a
+        // constant folded away before the loop must still reach its uses there:
+        // the definition is gone, so a skipped use would name an undeclared
+        // variable (`delete cfg[str6]` inside a generator's `while (true)`).
+        // A constant never changes, so substituting it per iteration is sound.
+        if is_loop(stmt) {
+            let consts: BTreeMap<String, Expression> = multi_use_defs
+                .iter()
+                .filter(|(name, value)| {
+                    is_constant_expr(value) && def_pos.get(*name).is_none_or(|p| *p <= i)
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            if !consts.is_empty() {
+                substitute_vars_in_stmt(stmt, &consts);
+            }
+            continue;
+        }
         if !has_nested_bodies(stmt) {
             continue;
         }
@@ -347,6 +365,17 @@ fn recurse_inline_blocks(
             )
         }),
     }
+}
+
+fn is_loop(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::While { .. }
+            | Statement::DoWhile { .. }
+            | Statement::For { .. }
+            | Statement::ForIn { .. }
+            | Statement::ForOf { .. }
+    )
 }
 
 fn has_nested_bodies(stmt: &Statement) -> bool {

@@ -61,6 +61,12 @@ pub(super) fn substitute_vars_in_expr(
     substitutor.visit_expression(expr);
 }
 
+// Substitute inside a whole statement, nested bodies included.
+pub(super) fn substitute_vars_in_stmt(stmt: &mut Statement, pending: &BTreeMap<String, Expression>) {
+    let mut substitutor = VarSubstitutor { pending };
+    substitutor.visit_statement(stmt);
+}
+
 struct VarSubstitutor<'p> {
     pending: &'p BTreeMap<String, Expression>,
 }
