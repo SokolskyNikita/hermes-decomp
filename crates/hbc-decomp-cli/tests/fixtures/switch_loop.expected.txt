@@ -1,0 +1,6 @@
+a0,b1,ce2,x3
+a0,b1,ce2,stop
+threw unknown
+1111
+ok 2
+bad 1

@@ -222,3 +222,71 @@ fn tracked_regression_fixtures_decompile() {
         failures.join("\n  ")
     );
 }
+
+// Tracked fixtures with a `<name>.expected.txt` next to them (the stdout of
+// `<name>.source.js`) must also round trip: the decompiled output, run under
+// node, prints the same. This catches output that parses but means something
+// else, such as a dropped `catch`. `print` is shimmed to `console.log`, and
+// the top-level function the decompiler emits as `global` is called.
+#[test]
+fn tracked_regression_fixtures_round_trip() {
+    if !node_available() {
+        eprintln!("skipped: node not available");
+        return;
+    }
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut cases: Vec<(PathBuf, PathBuf)> = std::fs::read_dir(&dir)
+        .expect("tests/fixtures")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "hbc"))
+        .filter_map(|hbc| {
+            let stem = hbc.file_stem()?.to_string_lossy().into_owned();
+            let name = stem.rsplit_once("_v").map_or(stem.as_str(), |(n, _)| n);
+            let expected = dir.join(format!("{name}.expected.txt"));
+            expected.exists().then_some((hbc, expected))
+        })
+        .collect();
+    cases.sort();
+    assert!(
+        !cases.is_empty(),
+        "no round-trip fixtures under {}",
+        dir.display()
+    );
+    let tmp = std::env::temp_dir().join(format!("hermes-e2e-rt-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let mut failures: Vec<String> = Vec::new();
+    for (hbc, expected) in &cases {
+        let name = hbc.file_name().unwrap().to_string_lossy().into_owned();
+        let out = tmp.join(format!("{name}.js"));
+        if let Err(e) = decompile(hbc, &out) {
+            failures.push(format!("{name}: {e}"));
+            continue;
+        }
+        let js = std::fs::read_to_string(&out).unwrap_or_default();
+        let runner = tmp.join(format!("{name}.rt.js"));
+        let script = format!(
+            "globalThis.print = (...a) => console.log(a.join(\" \"));\n{js}\n\
+             if (typeof global === \"function\") global(globalThis);\n"
+        );
+        std::fs::write(&runner, script).expect("write runner");
+        let output = Command::new("node").arg(&runner).output().expect("node");
+        let got = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        let want = std::fs::read_to_string(expected)
+            .expect("expected output")
+            .replace("\r\n", "\n");
+        if !output.status.success() || got != want {
+            let err = String::from_utf8_lossy(&output.stderr);
+            failures.push(format!(
+                "{name}: printed {got:?}, expected {want:?} {}",
+                err.lines().take(3).collect::<Vec<_>>().join(" | ")
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(
+        failures.is_empty(),
+        "round trip failed:\n  {}",
+        failures.join("\n  ")
+    );
+}

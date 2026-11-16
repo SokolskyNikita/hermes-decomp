@@ -1,7 +1,7 @@
-use super::recovery::recover_structure;
+use super::recovery::{recover_structure, recover_structure_inner, recover_try};
 use super::{RecoveryCtx, Structure};
 use crate::analysis::loops::LoopInfo;
-use crate::ir::{BlockId, Expression, Terminator};
+use crate::ir::{BlockId, CfgExceptionHandler, Expression, Terminator};
 
 pub(super) fn recover_loop(
     ctx: &mut RecoveryCtx<'_>,
@@ -87,6 +87,50 @@ pub(super) fn recover_loop(
                 }];
                 if !ctx.visited.contains(&exit_target) {
                     parts.push(recover_structure(ctx, exit_target, loop_stack));
+                }
+                return Structure::Sequence(parts);
+            }
+
+            // The header leaves the loop, but not to the loop's exit: the
+            // exit is elsewhere (another way out is the common one) and this
+            // edge goes to code of its own, typically a `throw`. That code
+            // runs from inside the loop: `while (true) { if (!c) { .. } .. }`.
+            // Emitting `while (c)` dropped it, as nothing else reaches it.
+            let out_target = match (true_in_loop, false_in_loop) {
+                (true, false) => Some(false_target),
+                (false, true) => Some(true_target),
+                _ => None,
+            };
+            if let Some(out) = out_target
+                .filter(|&o| loop_info.exit.is_some_and(|e| e != o) && !ctx.visited.contains(&o))
+            {
+                let (into, leave_cond) = if out == false_target {
+                    (
+                        true_target,
+                        Expression::unary(crate::ir::UnaryOp::Not, condition),
+                    )
+                } else {
+                    (false_target, condition)
+                };
+                let leave = recover_structure(ctx, out, &new_stack);
+                let rest = recover_structure(ctx, into, &new_stack);
+                let body = Structure::Sequence(vec![
+                    Structure::Block(loop_info.header, header_stmts),
+                    Structure::If {
+                        condition: leave_cond,
+                        then_: Box::new(leave),
+                        else_: Box::new(Structure::Block(loop_info.header, vec![])),
+                    },
+                    rest,
+                ]);
+                let mut parts = vec![make_loop(
+                    body,
+                    Expression::constant(crate::ir::Constant::Bool(true)),
+                )];
+                if let Some(exit) = loop_info.exit {
+                    if !ctx.visited.contains(&exit) {
+                        parts.push(recover_structure(ctx, exit, loop_stack));
+                    }
                 }
                 return Structure::Sequence(parts);
             }
@@ -177,20 +221,88 @@ pub(super) fn recover_loop(
         Terminator::Jump(target) => {
             let target = *target;
             if loop_info.body.contains(&target) {
+                // The header runs on every iteration, so its statements belong
+                // inside the loop. A header that ends in a plain jump comes from
+                // a block split, e.g. a `try` that opens the loop body: hoisting
+                // it ran the per-iteration copy (`i2 = i`) only once.
                 let body = recover_structure(ctx, target, &new_stack);
-                let mut parts = vec![Structure::Block(loop_info.header, header_stmts)];
+                let body = Structure::Sequence(vec![
+                    Structure::Block(loop_info.header, header_stmts),
+                    body,
+                ]);
+                let mut parts = Vec::new();
                 parts.push(make_loop(
                     body,
                     Expression::constant(crate::ir::Constant::Bool(true)),
                 ));
+                // The code after the loop, as the branch-header case does. It
+                // was dropped here, so a loop entered by a plain jump lost
+                // everything after its exit (often the function's `return`).
+                if let Some(exit) = loop_info.exit {
+                    if !ctx.visited.contains(&exit) {
+                        parts.push(recover_structure(ctx, exit, loop_stack));
+                    }
+                }
                 Structure::Sequence(parts)
             } else {
                 let next = recover_structure(ctx, target, loop_stack);
                 Structure::Sequence(vec![Structure::Block(loop_info.header, header_stmts), next])
             }
         }
-        _ => Structure::Block(loop_info.header, header_stmts),
+        _ => {
+            // Any other header terminator, in practice a `switch` (React's
+            // `while (fiber !== null) { switch (fiber.tag) { .. } .. }`, after
+            // the loop test is rotated to the bottom). The header is an
+            // ordinary block of the body: walk it as such, with the loop not
+            // started again, inside `while (true)`. The exits come out as
+            // `break` and the back edges as `continue`. Returning the header
+            // block alone dropped the switch and the whole loop body.
+            drop(header_stmts);
+            ctx.visited.remove(&loop_info.header);
+            let saved = ctx.plain_header.replace(loop_info.header);
+            let body = recover_structure_inner(ctx, loop_info.header, &new_stack);
+            ctx.plain_header = saved;
+            let mut parts = vec![make_loop(
+                body,
+                Expression::constant(crate::ir::Constant::Bool(true)),
+            )];
+            if let Some(exit) = loop_info.exit {
+                if !ctx.visited.contains(&exit) {
+                    parts.push(recover_structure(ctx, exit, loop_stack));
+                }
+            }
+            Structure::Sequence(parts)
+        }
     }
+}
+
+// A loop whose header block also starts a `try` protecting part of the body:
+// `while (true) { try { header; ... } catch { ... } }`. The header's own exit
+// test is recovered inside the try as an ordinary `if (..) break`.
+pub(super) fn recover_loop_with_try(
+    ctx: &mut RecoveryCtx<'_>,
+    loop_info: &LoopInfo,
+    handlers: &[&CfgExceptionHandler],
+    loop_stack: &[&LoopInfo],
+) -> Structure {
+    let mut new_stack = loop_stack.to_vec();
+    new_stack.push(loop_info);
+    let saved = ctx.plain_header.replace(loop_info.header);
+    let body = recover_try(ctx, loop_info.header, handlers, &new_stack);
+    ctx.plain_header = saved;
+    let mut parts = vec![Structure::Label(
+        format!("label{}", loop_stack.len()),
+        Box::new(Structure::While {
+            condition: Expression::constant(crate::ir::Constant::Bool(true)),
+            body: Box::new(body),
+        }),
+    )];
+    if let Some(exit) = loop_info.exit {
+        if !ctx.visited.contains(&exit) {
+            parts.push(recover_structure(ctx, exit, loop_stack));
+        }
+    }
+    Structure::Sequence(parts)
 }
 
 pub(super) fn split_update_from_body(
