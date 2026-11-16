@@ -15,6 +15,7 @@ impl MetroDetector {
         let mut reg_functions: HashMap<String, u32> = HashMap::new();
         let mut reg_arrays: HashMap<String, Vec<u32>> = HashMap::new();
         let mut reg_integers: HashMap<String, u32> = HashMap::new();
+        let mut reg_members: HashMap<String, String> = HashMap::new();
 
         for stmt in statements {
             Self::analyze_stmt(
@@ -22,6 +23,7 @@ impl MetroDetector {
                 &mut reg_functions,
                 &mut reg_arrays,
                 &mut reg_integers,
+                &mut reg_members,
                 registry,
                 param_counts,
             );
@@ -33,6 +35,7 @@ impl MetroDetector {
         reg_functions: &mut HashMap<String, u32>,
         reg_arrays: &mut HashMap<String, Vec<u32>>,
         reg_integers: &mut HashMap<String, u32>,
+        reg_members: &mut HashMap<String, String>,
         registry: &mut MetroRegistry,
         param_counts: &HashMap<u32, u32>,
     ) {
@@ -51,6 +54,19 @@ impl MetroDetector {
                     if let Some(deps) = extract_array_of_integers(value, Some(reg_integers)) {
                         reg_arrays.insert(name.clone(), deps);
                     }
+                    match value {
+                        Expression::Member { property, .. } => match member_name(property) {
+                            Some(m) => {
+                                reg_members.insert(name.clone(), m);
+                            }
+                            None => {
+                                reg_members.remove(&name);
+                            }
+                        },
+                        _ => {
+                            reg_members.remove(&name);
+                        }
+                    }
                     if let Some(n) = extract_integer(value) {
                         reg_integers.insert(name.clone(), n);
                     }
@@ -61,6 +77,7 @@ impl MetroDetector {
                     reg_functions,
                     reg_arrays,
                     reg_integers,
+                    reg_members,
                     registry,
                     param_counts,
                 );
@@ -71,6 +88,7 @@ impl MetroDetector {
                     reg_functions,
                     reg_arrays,
                     reg_integers,
+                    reg_members,
                     registry,
                     param_counts,
                 );
@@ -86,6 +104,7 @@ impl MetroDetector {
                         reg_functions,
                         reg_arrays,
                         reg_integers,
+                        reg_members,
                         registry,
                         param_counts,
                     );
@@ -96,6 +115,7 @@ impl MetroDetector {
                         reg_functions,
                         reg_arrays,
                         reg_integers,
+                        reg_members,
                         registry,
                         param_counts,
                     );
@@ -108,6 +128,7 @@ impl MetroDetector {
                         reg_functions,
                         reg_arrays,
                         reg_integers,
+                        reg_members,
                         registry,
                         param_counts,
                     );
@@ -120,6 +141,7 @@ impl MetroDetector {
                         reg_functions,
                         reg_arrays,
                         reg_integers,
+                        reg_members,
                         registry,
                         param_counts,
                     );
@@ -132,6 +154,7 @@ impl MetroDetector {
                         reg_functions,
                         reg_arrays,
                         reg_integers,
+                        reg_members,
                         registry,
                         param_counts,
                     );
@@ -146,14 +169,24 @@ impl MetroDetector {
         reg_functions: &HashMap<String, u32>,
         reg_arrays: &HashMap<String, Vec<u32>>,
         reg_integers: &HashMap<String, u32>,
+        reg_members: &HashMap<String, String>,
         registry: &mut MetroRegistry,
         param_counts: &HashMap<u32, u32>,
     ) {
-        if let Expression::Call {
-            callee: _,
-            arguments,
-        } = expr
-        {
+        if let Expression::Call { callee, arguments } = expr {
+            // A method call such as `xs.reduce(fn, 0)` has the same
+            // (this, function, integer) shape as a dependency-free `__d` call.
+            // Reject callees known to be a member other than `__d`.
+            let method = match &**callee {
+                Expression::Member { property, .. } => member_name(property),
+                Expression::Value(Value::Binding(Binding::Register(r))) => {
+                    reg_members.get(&format!("r{r}")).cloned()
+                }
+                _ => None,
+            };
+            if matches!(method, Some(ref m) if m != "__d") {
+                return;
+            }
             // Debug print
             if arguments.len() >= 3 {
                 // println!("DEBUG: checking call with {} args", arguments.len());
@@ -161,7 +194,9 @@ impl MetroDetector {
 
             // Metro format: __d(undefined, factory, moduleId, deps)
             // Arguments: [0] = undefined/context, [1] = function, [2] = moduleId, [3] = deps
-            if arguments.len() == 4 {
+            // A module with no dependencies is registered as __d(factory, moduleId),
+            // with no deps argument at all.
+            if arguments.len() == 4 || arguments.len() == 3 {
                 // Get function ID - either directly or via register/variable lookup
                 let function_id = match &arguments[1] {
                     Expression::Function { id, .. } => Some(id.0),
@@ -192,19 +227,19 @@ impl MetroDetector {
                 };
 
                 // Get dependencies - either directly or via register/variable lookup
-                let dependencies = match &arguments[3] {
-                    Expression::Array { .. } => {
-                        extract_array_of_integers(&arguments[3], Some(reg_integers))
-                            .unwrap_or_default()
+                let dependencies = match arguments.get(3) {
+                    None => Vec::new(),
+                    Some(deps @ Expression::Array { .. }) => {
+                        extract_array_of_integers(deps, Some(reg_integers)).unwrap_or_default()
                     }
-                    Expression::Value(Value::Binding(Binding::Register(r))) => reg_arrays
+                    Some(Expression::Value(Value::Binding(Binding::Register(r)))) => reg_arrays
                         .get(&format!("r{r}"))
                         .cloned()
                         .unwrap_or_default(),
-                    Expression::Value(Value::Binding(Binding::Variable(n))) => {
+                    Some(Expression::Value(Value::Binding(Binding::Variable(n)))) => {
                         reg_arrays.get(n).cloned().unwrap_or_default()
                     }
-                    _ => Vec::new(),
+                    Some(_) => Vec::new(),
                 };
 
                 // Register the module if we have function and module IDs
@@ -241,6 +276,13 @@ impl MetroDetector {
                 }
             }
         }
+    }
+}
+
+fn member_name(property: &crate::ir::PropertyKey) -> Option<String> {
+    match property {
+        crate::ir::PropertyKey::Ident(p) | crate::ir::PropertyKey::String(p) => Some(p.clone()),
+        _ => None,
     }
 }
 
@@ -306,4 +348,93 @@ pub(crate) fn is_meaningful_name(name: &str) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{AssignTarget, Constant, FunctionId, PropertyKey};
+
+    fn factory(id: u32) -> Expression {
+        Expression::Function {
+            id: FunctionId(id),
+            name: None,
+            is_arrow: false,
+            is_async: false,
+            is_generator: false,
+        }
+    }
+
+    fn int(n: i32) -> Expression {
+        Expression::Value(Value::Constant(Constant::Integer(n)))
+    }
+
+    fn define(arguments: Vec<Expression>) -> Statement {
+        Statement::Expr(Expression::Call {
+            callee: Box::new(Expression::Value(Value::Binding(Binding::Variable(
+                "__d".into(),
+            )))),
+            arguments,
+        })
+    }
+
+    // Metro registers a module without dependencies as `__d(factory, id)`.
+    // With the receiver that is three call arguments and no deps array.
+    #[test]
+    fn detects_modules_with_and_without_a_dependency_map() {
+        let undefined = || Expression::Value(Value::Constant(Constant::Undefined));
+        let stmts = vec![
+            define(vec![
+                undefined(),
+                factory(1),
+                int(0),
+                Expression::Array {
+                    elements: vec![Some(int(1))],
+                },
+            ]),
+            define(vec![undefined(), factory(2), int(1)]),
+        ];
+        let mut registry = MetroRegistry::new();
+        MetroDetector::analyze_statements(&stmts, &mut registry, &HashMap::new());
+
+        assert_eq!(registry.modules.len(), 2);
+        assert_eq!(registry.modules[&0].function_id, 1);
+        assert_eq!(registry.modules[&0].dependencies, vec![1]);
+        assert_eq!(registry.modules[&1].function_id, 2);
+        assert!(registry.modules[&1].dependencies.is_empty());
+        assert_eq!(registry.function_to_module.get(&2), Some(&1));
+    }
+
+    // `xs.reduce(fn, 0)` is also a call with (this, function, integer).
+    fn method_call(prop: &str) -> Vec<Statement> {
+        let reg = |r: u32| Expression::Value(Value::Binding(Binding::Register(r)));
+        vec![
+            Statement::Assign {
+                target: AssignTarget::Binding(Binding::Register(1)),
+                value: Expression::Member {
+                    object: Box::new(reg(0)),
+                    property: PropertyKey::Ident(prop.into()),
+                    optional: false,
+                },
+            },
+            Statement::Expr(Expression::Call {
+                callee: Box::new(reg(1)),
+                arguments: vec![reg(0), factory(5), int(0)],
+            }),
+        ]
+    }
+
+    #[test]
+    fn method_call_with_function_and_int_is_not_a_module() {
+        let mut registry = MetroRegistry::new();
+        MetroDetector::analyze_statements(&method_call("reduce"), &mut registry, &HashMap::new());
+        assert!(registry.modules.is_empty());
+    }
+
+    #[test]
+    fn dependency_free_define_call_is_still_a_module() {
+        let mut registry = MetroRegistry::new();
+        MetroDetector::analyze_statements(&method_call("__d"), &mut registry, &HashMap::new());
+        assert_eq!(registry.modules.len(), 1);
+    }
 }
